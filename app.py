@@ -92,7 +92,8 @@ Dado un mensaje del usuario, responde SOLO con un JSON (sin texto adicional, sin
 {{{{
   "type": "reminder" | "note" | "list_reminders" | "list_notes" | "question",
   "content": "texto limpio del recordatorio o nota (null si no aplica)",
-  "due_at": "fecha y hora en formato ISO 8601 con zona horaria, o null si no es un recordatorio o no se especificó hora"
+  "due_at": "fecha y hora en formato ISO 8601 con zona horaria, o null si no es un recordatorio o no se especificó hora",
+  "fact_to_remember": "un dato personal duradero sobre el usuario mencionado en el mensaje (nombre, gustos, trabajo, relaciones, preferencias, etc.), en pocas palabras y en tercera persona, o null si no hay ningún dato nuevo que valga la pena recordar"
 }}}}
 
 Reglas:
@@ -103,13 +104,23 @@ Reglas:
 - "question": cualquier otra cosa, incluyendo preguntas generales tipo chat.
 - Si el usuario da una hora relativa ("en 2 horas", "mañana", "el viernes"), calcula la fecha absoluta usando la fecha/hora actual dada arriba.
 - Si es "reminder" pero no dio ninguna indicación de tiempo, trátalo como "note" en vez de "reminder".
+- "fact_to_remember" se aplica SIN IMPORTAR el "type": aunque el mensaje sea una pregunta o un comentario casual,
+  si menciona algo duradero sobre el usuario (ej. "me llamo Santiago", "vivo en Buenos Aires", "no me gusta el picante"),
+  extráelo aquí. Si el mensaje no aporta ningún dato nuevo sobre el usuario, deja este campo en null.
 """
+
+
 
 CHAT_SYSTEM_PROMPT = """Eres un asistente personal amigable y conciso que vive dentro de WhatsApp.
 La fecha y hora actual es {now} (zona horaria {tzname}).
 Respondes preguntas generales con claridad y brevedad, en el mismo idioma en que te escriben.
 Si te preguntan la hora, la fecha, o el día de la semana, respóndelo directamente usando el dato de arriba.
-Si no sabes algo con certeza, dilo honestamente."""
+
+Estas son las notas que el usuario te ha pedido guardar anteriormente. Úsalas para responder
+si la pregunta se relaciona con algo que ya te contó (por ejemplo, "¿cuál es mi color favorito?"):
+{notes}
+
+Si la respuesta no está en las notas ni la sabes con certeza, dilo honestamente."""
 
 
 def call_gemini(system_instruction: str, contents: list, max_retries: int = 3) -> str:
@@ -177,7 +188,11 @@ def classify_message(user_message: str) -> dict:
 def answer_general_question(phone: str, user_message: str) -> str:
     conn = get_db()
     history_rows = conn.execute(
-        "SELECT role, content FROM conversation_history WHERE phone = ? ORDER BY id DESC LIMIT 10",
+        "SELECT role, content FROM conversation_history WHERE phone = ? ORDER BY id DESC LIMIT 30",
+        (phone,),
+    ).fetchall()
+    note_rows = conn.execute(
+        "SELECT content FROM notes WHERE phone = ? ORDER BY id DESC LIMIT 50",
         (phone,),
     ).fetchall()
     conn.close()
@@ -190,7 +205,8 @@ def answer_general_question(phone: str, user_message: str) -> str:
     contents.append({"role": "user", "parts": [{"text": user_message}]})
 
     now_str = datetime.now(tz).strftime("%A %d de %B de %Y, %H:%M")
-    system = CHAT_SYSTEM_PROMPT.format(now=now_str, tzname=APP_TIMEZONE)
+    notes_text = "\n".join(f"- {r['content']}" for r in note_rows) if note_rows else "(el usuario no tiene notas guardadas todavía)"
+    system = CHAT_SYSTEM_PROMPT.format(now=now_str, tzname=APP_TIMEZONE, notes=notes_text)
     reply = call_gemini(system, contents).strip()
 
     conn = get_db()
@@ -224,6 +240,17 @@ def process_and_reply(phone: str, incoming_msg: str):
 
     conn = get_db()
     now_iso = datetime.now(tz).isoformat()
+
+    # Si el clasificador detectó un dato personal duradero (aunque el mensaje
+    # sea una pregunta o comentario casual), lo guardamos como nota aparte,
+    # sin duplicar el "content" si ya se guardó como nota explícita.
+    fact = result.get("fact_to_remember")
+    if fact and not (result["type"] == "note" and fact.strip() == (result.get("content") or "").strip()):
+        conn.execute(
+            "INSERT INTO notes (phone, content, created_at) VALUES (?, ?, ?)",
+            (phone, fact, now_iso),
+        )
+        conn.commit()
 
     if result["type"] == "reminder" and result.get("due_at"):
         conn.execute(
