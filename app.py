@@ -26,7 +26,7 @@ load_dotenv()
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
-TWILIO_WHATSAPP_NUMBER = os.environ["TWILIO_WHATSAPP_NUMBER"]  # ej: whatsapp:+14155238886
+TWILIO_WHATSAPP_NUMBER = os.environ["TWILIO_WHATSAPP_NUMBER"] # ej: whatsapp:+14155238886
 APP_TIMEZONE = os.environ.get("APP_TIMEZONE", "America/Mexico_City")
 DB_PATH = os.environ.get("DB_PATH", "memorae.db")
 GEMINI_MODEL = "gemini-3.5-flash"
@@ -113,6 +113,12 @@ def call_gemini(system_instruction: str, contents: list) -> str:
     payload = {
         "system_instruction": {"parts": [{"text": system_instruction}]},
         "contents": contents,
+        # Desactivamos el modo "thinking": para clasificar mensajes cortos
+        # no lo necesitamos, y nos ahorra varios segundos de latencia.
+        "generationConfig": {
+            "thinkingConfig": {"thinkingBudget": 0},
+            "maxOutputTokens": 500,
+        },
     }
     resp = requests.post(
         GEMINI_API_URL,
@@ -180,7 +186,7 @@ def answer_general_question(phone: str, user_message: str) -> str:
 @app.route("/webhook", methods=["POST"])
 def webhook():
     incoming_msg = request.values.get("Body", "").strip()
-    phone = request.values.get("From", "")  # ej: whatsapp:+52155...
+    phone = request.values.get("From", "") # ej: whatsapp:+52155...
 
     resp = MessagingResponse()
     msg = resp.message()
@@ -237,7 +243,7 @@ def webhook():
                 lines.append(f"• {r['content']}")
             msg.body("\n".join(lines))
 
-    else:  # question
+    else: # question
         conn.close()
         reply = answer_general_question(phone, incoming_msg)
         msg.body(reply)
