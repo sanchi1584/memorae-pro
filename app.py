@@ -8,6 +8,7 @@ Recibe mensajes de WhatsApp (via Twilio), usa Gemini para entender la intención
 import os
 import json
 import sqlite3
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -26,7 +27,7 @@ load_dotenv()
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
-TWILIO_WHATSAPP_NUMBER = os.environ["TWILIO_WHATSAPP_NUMBER"] # ej: whatsapp:+14155238886
+TWILIO_WHATSAPP_NUMBER = os.environ["TWILIO_WHATSAPP_NUMBER"]  # ej: whatsapp:+14155238886
 APP_TIMEZONE = os.environ.get("APP_TIMEZONE", "America/Mexico_City")
 DB_PATH = os.environ.get("DB_PATH", "memorae.db")
 GEMINI_MODEL = "gemini-3.5-flash"
@@ -104,12 +105,15 @@ Reglas:
 """
 
 CHAT_SYSTEM_PROMPT = """Eres un asistente personal amigable y conciso que vive dentro de WhatsApp.
+La fecha y hora actual es {now} (zona horaria {tzname}).
 Respondes preguntas generales con claridad y brevedad, en el mismo idioma en que te escriben.
+Si te preguntan la hora, la fecha, o el día de la semana, respóndelo directamente usando el dato de arriba.
 Si no sabes algo con certeza, dilo honestamente."""
 
 
-def call_gemini(system_instruction: str, contents: list) -> str:
-    """Llama a la API REST de Gemini directamente (sin SDK pesado)."""
+def call_gemini(system_instruction: str, contents: list, max_retries: int = 2) -> str:
+    """Llama a la API REST de Gemini directamente (sin SDK pesado).
+    Reintenta automáticamente si el servicio está temporalmente saturado (503/429)."""
     payload = {
         "system_instruction": {"parts": [{"text": system_instruction}]},
         "contents": contents,
@@ -120,18 +124,23 @@ def call_gemini(system_instruction: str, contents: list) -> str:
             "maxOutputTokens": 500,
         },
     }
-    resp = requests.post(
-        GEMINI_API_URL,
-        headers={
-            "Content-Type": "application/json",
-            "x-goog-api-key": GEMINI_API_KEY,
-        },
-        json=payload,
-        timeout=55,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+
+    for attempt in range(max_retries + 1):
+        resp = requests.post(
+            GEMINI_API_URL,
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": GEMINI_API_KEY,
+            },
+            json=payload,
+            timeout=20,
+        )
+        if resp.status_code in (503, 429) and attempt < max_retries:
+            time.sleep(1.5)
+            continue
+        resp.raise_for_status()
+        data = resp.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
 def classify_message(user_message: str) -> dict:
@@ -163,7 +172,9 @@ def answer_general_question(phone: str, user_message: str) -> str:
     ]
     contents.append({"role": "user", "parts": [{"text": user_message}]})
 
-    reply = call_gemini(CHAT_SYSTEM_PROMPT, contents).strip()
+    now_str = datetime.now(tz).strftime("%A %d de %B de %Y, %H:%M")
+    system = CHAT_SYSTEM_PROMPT.format(now=now_str, tzname=APP_TIMEZONE)
+    reply = call_gemini(system, contents).strip()
 
     conn = get_db()
     now_iso = datetime.now(tz).isoformat()
@@ -186,7 +197,7 @@ def answer_general_question(phone: str, user_message: str) -> str:
 @app.route("/webhook", methods=["POST"])
 def webhook():
     incoming_msg = request.values.get("Body", "").strip()
-    phone = request.values.get("From", "") # ej: whatsapp:+52155...
+    phone = request.values.get("From", "")  # ej: whatsapp:+52155...
 
     resp = MessagingResponse()
     msg = resp.message()
@@ -195,7 +206,13 @@ def webhook():
         msg.body("No recibí ningún texto. ¿Puedes intentar de nuevo?")
         return Response(str(resp), mimetype="application/xml")
 
-    result = classify_message(incoming_msg)
+    try:
+        result = classify_message(incoming_msg)
+    except Exception as e:
+        print(f"Error clasificando mensaje: {e}")
+        msg.body("⚠️ Tuve un problema entendiendo tu mensaje (el servicio de IA no respondió). Intenta de nuevo en un momento.")
+        return Response(str(resp), mimetype="application/xml")
+
     conn = get_db()
     now_iso = datetime.now(tz).isoformat()
 
@@ -243,9 +260,13 @@ def webhook():
                 lines.append(f"• {r['content']}")
             msg.body("\n".join(lines))
 
-    else: # question
+    else:  # question
         conn.close()
-        reply = answer_general_question(phone, incoming_msg)
+        try:
+            reply = answer_general_question(phone, incoming_msg)
+        except Exception as e:
+            print(f"Error respondiendo pregunta general: {e}")
+            reply = "⚠️ Tuve un problema pensando la respuesta (el servicio de IA no respondió). Intenta de nuevo en un momento."
         msg.body(reply)
         return Response(str(resp), mimetype="application/xml")
 
