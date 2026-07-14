@@ -9,6 +9,7 @@ import os
 import json
 import sqlite3
 import time
+import threading
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -202,24 +203,16 @@ def answer_general_question(phone: str, user_message: str) -> str:
 # --------------------------------------------------------------------------
 # Webhook de Twilio
 # --------------------------------------------------------------------------
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    incoming_msg = request.values.get("Body", "").strip()
-    phone = request.values.get("From", "")  # ej: whatsapp:+52155...
-
-    resp = MessagingResponse()
-    msg = resp.message()
-
-    if not incoming_msg:
-        msg.body("No recibí ningún texto. ¿Puedes intentar de nuevo?")
-        return Response(str(resp), mimetype="application/xml")
-
+def process_and_reply(phone: str, incoming_msg: str):
+    """Hace todo el trabajo pesado (clasificar con Gemini, guardar en BD) y
+    manda la respuesta real por WhatsApp usando la API de Twilio directamente
+    (no TwiML), para no depender del límite de tiempo del webhook."""
     try:
         result = classify_message(incoming_msg)
     except Exception as e:
         print(f"Error clasificando mensaje: {e}")
-        msg.body("⚠️ Tuve un problema entendiendo tu mensaje (el servicio de IA no respondió). Intenta de nuevo en un momento.")
-        return Response(str(resp), mimetype="application/xml")
+        send_whatsapp(phone, "⚠️ Tuve un problema entendiendo tu mensaje (el servicio de IA no respondió). Intenta de nuevo en un momento.")
+        return
 
     conn = get_db()
     now_iso = datetime.now(tz).isoformat()
@@ -231,7 +224,7 @@ def webhook():
         )
         conn.commit()
         due_dt = datetime.fromisoformat(result["due_at"])
-        msg.body(f"✅ Listo, te recordaré: \"{result['content']}\"\n🕒 {due_dt.strftime('%d/%m/%Y %H:%M')}")
+        reply = f"✅ Listo, te recordaré: \"{result['content']}\"\n🕒 {due_dt.strftime('%d/%m/%Y %H:%M')}"
 
     elif result["type"] == "note":
         conn.execute(
@@ -239,7 +232,7 @@ def webhook():
             (phone, result["content"], now_iso),
         )
         conn.commit()
-        msg.body(f"📝 Anotado: \"{result['content']}\"")
+        reply = f"📝 Anotado: \"{result['content']}\""
 
     elif result["type"] == "list_reminders":
         rows = conn.execute(
@@ -247,13 +240,13 @@ def webhook():
             (phone,),
         ).fetchall()
         if not rows:
-            msg.body("No tienes recordatorios pendientes.")
+            reply = "No tienes recordatorios pendientes."
         else:
             lines = ["📌 Tus recordatorios pendientes:"]
             for r in rows:
                 d = datetime.fromisoformat(r["due_at"])
                 lines.append(f"• {r['content']} — {d.strftime('%d/%m %H:%M')}")
-            msg.body("\n".join(lines))
+            reply = "\n".join(lines)
 
     elif result["type"] == "list_notes":
         rows = conn.execute(
@@ -261,24 +254,51 @@ def webhook():
             (phone,),
         ).fetchall()
         if not rows:
-            msg.body("Todavía no tienes notas guardadas.")
+            reply = "Todavía no tienes notas guardadas."
         else:
             lines = ["🗒️ Tus notas:"]
             for r in rows:
                 lines.append(f"• {r['content']}")
-            msg.body("\n".join(lines))
+            reply = "\n".join(lines)
 
     else:  # question
-        conn.close()
         try:
             reply = answer_general_question(phone, incoming_msg)
         except Exception as e:
             print(f"Error respondiendo pregunta general: {e}")
             reply = "⚠️ Tuve un problema pensando la respuesta (el servicio de IA no respondió). Intenta de nuevo en un momento."
-        msg.body(reply)
-        return Response(str(resp), mimetype="application/xml")
 
     conn.close()
+    send_whatsapp(phone, reply)
+
+
+def send_whatsapp(phone: str, body: str):
+    """Manda un mensaje de WhatsApp usando la API de Twilio (no TwiML)."""
+    try:
+        twilio_client.messages.create(
+            from_=TWILIO_WHATSAPP_NUMBER,
+            to=phone,
+            body=body,
+        )
+    except Exception as e:
+        print(f"Error mandando mensaje de WhatsApp a {phone}: {e}")
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    incoming_msg = request.values.get("Body", "").strip()
+    phone = request.values.get("From", "")  # ej: whatsapp:+52155...
+
+    # Respondemos a Twilio al instante (sin esperar a Gemini), para no
+    # depender de su límite de tiempo. El mensaje real se manda aparte,
+    # en un hilo en segundo plano, usando la API de Twilio directamente.
+    resp = MessagingResponse()
+
+    if not incoming_msg:
+        resp.message("No recibí ningún texto. ¿Puedes intentar de nuevo?")
+        return Response(str(resp), mimetype="application/xml")
+
+    threading.Thread(target=process_and_reply, args=(phone, incoming_msg), daemon=True).start()
     return Response(str(resp), mimetype="application/xml")
 
 
