@@ -116,7 +116,10 @@ def call_gemini(system_instruction: str, contents: list) -> str:
     }
     resp = requests.post(
         GEMINI_API_URL,
-        params={"key": GEMINI_API_KEY},
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMINI_API_KEY,
+        },
         json=payload,
         timeout=55,
     )
