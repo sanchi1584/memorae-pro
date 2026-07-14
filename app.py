@@ -118,7 +118,7 @@ def call_gemini(system_instruction: str, contents: list) -> str:
         GEMINI_API_URL,
         params={"key": GEMINI_API_KEY},
         json=payload,
-        timeout=25,
+        timeout=55,
     )
     resp.raise_for_status()
     data = resp.json()
