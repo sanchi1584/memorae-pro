@@ -112,12 +112,11 @@ Si te preguntan la hora, la fecha, o el día de la semana, respóndelo directame
 Si no sabes algo con certeza, dilo honestamente."""
 
 
-def call_gemini(system_instruction: str, contents: list, max_retries: int = 8) -> str:
+def call_gemini(system_instruction: str, contents: list, max_retries: int = 3) -> str:
     """Llama a la API REST de Gemini directamente (sin SDK pesado).
-    Reintenta automáticamente si el servicio está saturado (503/429)
-    o si la conexión tarda demasiado (timeout), con espera progresiva.
-    Como esto corre en segundo plano (no bloquea la respuesta a Twilio),
-    podemos permitirnos ser pacientes y reintentar varias veces."""
+    Reintenta automáticamente si el servicio está saturado (503) o si se
+    excedió el límite de solicitudes por minuto (429), con esperas más
+    largas para el 429 (que necesita que se libere la cuota del minuto)."""
     payload = {
         "system_instruction": {"parts": [{"text": system_instruction}]},
         "contents": contents,
@@ -142,13 +141,19 @@ def call_gemini(system_instruction: str, contents: list, max_retries: int = 8) -
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             last_error = e
             if attempt < max_retries:
-                time.sleep(min(2 + attempt * 2, 15))
+                time.sleep(3 + attempt * 3)
                 continue
             raise
 
-        if resp.status_code in (503, 429) and attempt < max_retries:
-            print(f"Gemini devolvió {resp.status_code}, reintentando (intento {attempt + 1}/{max_retries + 1})...")
-            time.sleep(min(2 + attempt * 2, 15))
+        if resp.status_code == 429 and attempt < max_retries:
+            wait = 15 + attempt * 10  # el límite de RPM tarda en liberarse
+            print(f"Gemini devolvió 429 (límite de cuota), esperando {wait}s antes de reintentar (intento {attempt + 1}/{max_retries + 1})...")
+            time.sleep(wait)
+            continue
+        if resp.status_code == 503 and attempt < max_retries:
+            wait = 2 + attempt * 3
+            print(f"Gemini devolvió 503 (saturado), esperando {wait}s antes de reintentar (intento {attempt + 1}/{max_retries + 1})...")
+            time.sleep(wait)
             continue
         resp.raise_for_status()
         data = resp.json()
