@@ -15,7 +15,7 @@ from flask import Flask, request, Response
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client as TwilioClient
 from apscheduler.schedulers.background import BackgroundScheduler
-import google.generativeai as genai
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -30,8 +30,8 @@ TWILIO_WHATSAPP_NUMBER = os.environ["TWILIO_WHATSAPP_NUMBER"]  # ej: whatsapp:+1
 APP_TIMEZONE = os.environ.get("APP_TIMEZONE", "America/Mexico_City")
 DB_PATH = os.environ.get("DB_PATH", "memorae.db")
 GEMINI_MODEL = "gemini-3.5-flash"
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
-genai.configure(api_key=GEMINI_API_KEY)
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 tz = ZoneInfo(APP_TIMEZONE)
 
@@ -108,13 +108,29 @@ Respondes preguntas generales con claridad y brevedad, en el mismo idioma en que
 Si no sabes algo con certeza, dilo honestamente."""
 
 
+def call_gemini(system_instruction: str, contents: list) -> str:
+    """Llama a la API REST de Gemini directamente (sin SDK pesado)."""
+    payload = {
+        "system_instruction": {"parts": [{"text": system_instruction}]},
+        "contents": contents,
+    }
+    resp = requests.post(
+        GEMINI_API_URL,
+        params={"key": GEMINI_API_KEY},
+        json=payload,
+        timeout=25,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data["candidates"][0]["content"]["parts"][0]["text"]
+
+
 def classify_message(user_message: str) -> dict:
     now_str = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %Z")
     system = CLASSIFIER_SYSTEM_PROMPT.format(now=now_str)
 
-    model = genai.GenerativeModel(GEMINI_MODEL, system_instruction=system)
-    response = model.generate_content(user_message)
-    raw = response.text.strip()
+    contents = [{"role": "user", "parts": [{"text": user_message}]}]
+    raw = call_gemini(system, contents).strip()
     raw = raw.replace("```json", "").replace("```", "").strip()
     try:
         return json.loads(raw)
@@ -132,15 +148,13 @@ def answer_general_question(phone: str, user_message: str) -> str:
     conn.close()
 
     # Gemini usa "model" en vez de "assistant" como rol, y "parts" en vez de "content"
-    gemini_history = [
-        {"role": "model" if r["role"] == "assistant" else "user", "parts": [r["content"]]}
+    contents = [
+        {"role": "model" if r["role"] == "assistant" else "user", "parts": [{"text": r["content"]}]}
         for r in reversed(history_rows)
     ]
+    contents.append({"role": "user", "parts": [{"text": user_message}]})
 
-    model = genai.GenerativeModel(GEMINI_MODEL, system_instruction=CHAT_SYSTEM_PROMPT)
-    chat = model.start_chat(history=gemini_history)
-    response = chat.send_message(user_message)
-    reply = response.text.strip()
+    reply = call_gemini(CHAT_SYSTEM_PROMPT, contents).strip()
 
     conn = get_db()
     now_iso = datetime.now(tz).isoformat()
