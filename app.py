@@ -113,28 +113,36 @@ Si no sabes algo con certeza, dilo honestamente."""
 
 def call_gemini(system_instruction: str, contents: list, max_retries: int = 2) -> str:
     """Llama a la API REST de Gemini directamente (sin SDK pesado).
-    Reintenta automáticamente si el servicio está temporalmente saturado (503/429)."""
+    Reintenta automáticamente si el servicio está saturado (503/429)
+    o si la conexión tarda demasiado (timeout)."""
     payload = {
         "system_instruction": {"parts": [{"text": system_instruction}]},
         "contents": contents,
-        # Desactivamos el modo "thinking": para clasificar mensajes cortos
-        # no lo necesitamos, y nos ahorra varios segundos de latencia.
         "generationConfig": {
             "thinkingConfig": {"thinkingBudget": 0},
             "maxOutputTokens": 500,
         },
     }
 
+    last_error = None
     for attempt in range(max_retries + 1):
-        resp = requests.post(
-            GEMINI_API_URL,
-            headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": GEMINI_API_KEY,
-            },
-            json=payload,
-            timeout=20,
-        )
+        try:
+            resp = requests.post(
+                GEMINI_API_URL,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": GEMINI_API_KEY,
+                },
+                json=payload,
+                timeout=25,
+            )
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_error = e
+            if attempt < max_retries:
+                time.sleep(1)
+                continue
+            raise
+
         if resp.status_code in (503, 429) and attempt < max_retries:
             time.sleep(1.5)
             continue
