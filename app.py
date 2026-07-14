@@ -92,7 +92,8 @@ Dado un mensaje del usuario, responde SOLO con un JSON (sin texto adicional, sin
 {{{{
   "type": "reminder" | "note" | "list_reminders" | "list_notes" | "question",
   "content": "texto limpio del recordatorio o nota (null si no aplica)",
-  "due_at": "fecha y hora en formato ISO 8601 con zona horaria, o null si no es un recordatorio o no se especificó hora",
+  "due_at": "fecha y hora en formato ISO 8601 con zona horaria del PRIMER (o único) aviso, o null si no aplica",
+  "occurrences": ["fecha y hora ISO 8601 de cada aviso adicional"] o null si es un recordatorio de una sola vez,
   "fact_to_remember": "un dato personal duradero sobre el usuario mencionado en el mensaje (nombre, gustos, trabajo, relaciones, preferencias, etc.), en pocas palabras y en tercera persona, o null si no hay ningún dato nuevo que valga la pena recordar"
 }}}}
 
@@ -104,6 +105,12 @@ Reglas:
 - "question": cualquier otra cosa, incluyendo preguntas generales tipo chat.
 - Si el usuario da una hora relativa ("en 2 horas", "mañana", "el viernes"), calcula la fecha absoluta usando la fecha/hora actual dada arriba.
 - Si es "reminder" pero no dio ninguna indicación de tiempo, trátalo como "note" en vez de "reminder".
+- RECORDATORIOS RECURRENTES: si el usuario pide que se repita ("todos los días", "de lunes a viernes",
+  "hasta el viernes", "cada día a partir de mañana"), calcula TODAS las fechas/horas concretas dentro del
+  rango que haya indicado (excluyendo fines de semana solo si el usuario lo pidió explícitamente) y ponlas
+  en "occurrences" (la primera fecha va en "due_at", el resto en "occurrences"). Si el usuario no puso una
+  fecha final ("todos los días" sin decir hasta cuándo), asume un límite razonable de 14 días desde hoy.
+  Nunca generes más de 30 fechas en total.
 - "fact_to_remember" se aplica SIN IMPORTAR el "type": aunque el mensaje sea una pregunta o un comentario casual,
   si menciona algo duradero sobre el usuario (ej. "me llamo Santiago", "vivo en Buenos Aires", "no me gusta el picante"),
   extráelo aquí. Si el mensaje no aporta ningún dato nuevo sobre el usuario, deja este campo en null.
@@ -261,13 +268,25 @@ def process_and_reply(phone: str, incoming_msg: str):
             conn.commit()
 
         if result["type"] == "reminder" and result.get("due_at"):
-            conn.execute(
-                "INSERT INTO reminders (phone, content, due_at, created_at) VALUES (?, ?, ?, ?)",
-                (phone, result["content"], result["due_at"], now_iso),
-            )
+            all_dates = [result["due_at"]] + [d for d in (result.get("occurrences") or []) if d]
+            # Tope de seguridad: nunca más de 30 avisos de una sola vez
+            all_dates = all_dates[:30]
+            for due_at in all_dates:
+                conn.execute(
+                    "INSERT INTO reminders (phone, content, due_at, created_at) VALUES (?, ?, ?, ?)",
+                    (phone, result["content"], due_at, now_iso),
+                )
             conn.commit()
-            due_dt = datetime.fromisoformat(result["due_at"])
-            reply = f"✅ Listo, te recordaré: \"{result['content']}\"\n🕒 {due_dt.strftime('%d/%m/%Y %H:%M')}"
+            first_dt = datetime.fromisoformat(all_dates[0])
+            if len(all_dates) > 1:
+                last_dt = datetime.fromisoformat(all_dates[-1])
+                reply = (
+                    f"✅ Listo, te recordaré: \"{result['content']}\"\n"
+                    f"🔁 {len(all_dates)} avisos, desde el {first_dt.strftime('%d/%m/%Y %H:%M')} "
+                    f"hasta el {last_dt.strftime('%d/%m/%Y %H:%M')}"
+                )
+            else:
+                reply = f"✅ Listo, te recordaré: \"{result['content']}\"\n🕒 {first_dt.strftime('%d/%m/%Y %H:%M')}"
 
         elif result["type"] == "note":
             conn.execute(
