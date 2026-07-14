@@ -111,10 +111,10 @@ Si te preguntan la hora, la fecha, o el día de la semana, respóndelo directame
 Si no sabes algo con certeza, dilo honestamente."""
 
 
-def call_gemini(system_instruction: str, contents: list, max_retries: int = 2) -> str:
+def call_gemini(system_instruction: str, contents: list, max_retries: int = 4) -> str:
     """Llama a la API REST de Gemini directamente (sin SDK pesado).
     Reintenta automáticamente si el servicio está saturado (503/429)
-    o si la conexión tarda demasiado (timeout)."""
+    o si la conexión tarda demasiado (timeout), con espera progresiva."""
     payload = {
         "system_instruction": {"parts": [{"text": system_instruction}]},
         "contents": contents,
@@ -134,17 +134,17 @@ def call_gemini(system_instruction: str, contents: list, max_retries: int = 2) -
                     "x-goog-api-key": GEMINI_API_KEY,
                 },
                 json=payload,
-                timeout=25,
+                timeout=15,
             )
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             last_error = e
             if attempt < max_retries:
-                time.sleep(1)
+                time.sleep(1 + attempt)
                 continue
             raise
 
         if resp.status_code in (503, 429) and attempt < max_retries:
-            time.sleep(1.5)
+            time.sleep(1 + attempt)
             continue
         resp.raise_for_status()
         data = resp.json()
