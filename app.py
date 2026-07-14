@@ -238,72 +238,84 @@ def process_and_reply(phone: str, incoming_msg: str):
         send_whatsapp(phone, "⚠️ Tuve un problema entendiendo tu mensaje (el servicio de IA no respondió). Intenta de nuevo en un momento.")
         return
 
+    # Protección: si el modelo dijo "reminder" o "note" pero no vino contenido
+    # (puede pasar de vez en cuando), lo tratamos como pregunta general en vez
+    # de fallar al intentar guardar una nota/recordatorio vacío.
+    if result.get("type") in ("reminder", "note") and not (result.get("content") or "").strip():
+        print(f"Advertencia: '{result.get('type')}' sin contenido, tratando como pregunta general.")
+        result["type"] = "question"
+
     conn = get_db()
     now_iso = datetime.now(tz).isoformat()
 
-    # Si el clasificador detectó un dato personal duradero (aunque el mensaje
-    # sea una pregunta o comentario casual), lo guardamos como nota aparte,
-    # sin duplicar el "content" si ya se guardó como nota explícita.
-    fact = result.get("fact_to_remember")
-    if fact and not (result["type"] == "note" and fact.strip() == (result.get("content") or "").strip()):
-        conn.execute(
-            "INSERT INTO notes (phone, content, created_at) VALUES (?, ?, ?)",
-            (phone, fact, now_iso),
-        )
-        conn.commit()
+    try:
+        # Si el clasificador detectó un dato personal duradero (aunque el mensaje
+        # sea una pregunta o comentario casual), lo guardamos como nota aparte,
+        # sin duplicar el "content" si ya se guardó como nota explícita.
+        fact = result.get("fact_to_remember")
+        if fact and not (result["type"] == "note" and fact.strip() == (result.get("content") or "").strip()):
+            conn.execute(
+                "INSERT INTO notes (phone, content, created_at) VALUES (?, ?, ?)",
+                (phone, fact, now_iso),
+            )
+            conn.commit()
 
-    if result["type"] == "reminder" and result.get("due_at"):
-        conn.execute(
-            "INSERT INTO reminders (phone, content, due_at, created_at) VALUES (?, ?, ?, ?)",
-            (phone, result["content"], result["due_at"], now_iso),
-        )
-        conn.commit()
-        due_dt = datetime.fromisoformat(result["due_at"])
-        reply = f"✅ Listo, te recordaré: \"{result['content']}\"\n🕒 {due_dt.strftime('%d/%m/%Y %H:%M')}"
+        if result["type"] == "reminder" and result.get("due_at"):
+            conn.execute(
+                "INSERT INTO reminders (phone, content, due_at, created_at) VALUES (?, ?, ?, ?)",
+                (phone, result["content"], result["due_at"], now_iso),
+            )
+            conn.commit()
+            due_dt = datetime.fromisoformat(result["due_at"])
+            reply = f"✅ Listo, te recordaré: \"{result['content']}\"\n🕒 {due_dt.strftime('%d/%m/%Y %H:%M')}"
 
-    elif result["type"] == "note":
-        conn.execute(
-            "INSERT INTO notes (phone, content, created_at) VALUES (?, ?, ?)",
-            (phone, result["content"], now_iso),
-        )
-        conn.commit()
-        reply = f"📝 Anotado: \"{result['content']}\""
+        elif result["type"] == "note":
+            conn.execute(
+                "INSERT INTO notes (phone, content, created_at) VALUES (?, ?, ?)",
+                (phone, result["content"], now_iso),
+            )
+            conn.commit()
+            reply = f"📝 Anotado: \"{result['content']}\""
 
-    elif result["type"] == "list_reminders":
-        rows = conn.execute(
-            "SELECT content, due_at FROM reminders WHERE phone = ? AND sent = 0 ORDER BY due_at ASC",
-            (phone,),
-        ).fetchall()
-        if not rows:
-            reply = "No tienes recordatorios pendientes."
-        else:
-            lines = ["📌 Tus recordatorios pendientes:"]
-            for r in rows:
-                d = datetime.fromisoformat(r["due_at"])
-                lines.append(f"• {r['content']} — {d.strftime('%d/%m %H:%M')}")
-            reply = "\n".join(lines)
+        elif result["type"] == "list_reminders":
+            rows = conn.execute(
+                "SELECT content, due_at FROM reminders WHERE phone = ? AND sent = 0 ORDER BY due_at ASC",
+                (phone,),
+            ).fetchall()
+            if not rows:
+                reply = "No tienes recordatorios pendientes."
+            else:
+                lines = ["📌 Tus recordatorios pendientes:"]
+                for r in rows:
+                    d = datetime.fromisoformat(r["due_at"])
+                    lines.append(f"• {r['content']} — {d.strftime('%d/%m %H:%M')}")
+                reply = "\n".join(lines)
 
-    elif result["type"] == "list_notes":
-        rows = conn.execute(
-            "SELECT content, created_at FROM notes WHERE phone = ? ORDER BY id DESC LIMIT 20",
-            (phone,),
-        ).fetchall()
-        if not rows:
-            reply = "Todavía no tienes notas guardadas."
-        else:
-            lines = ["🗒️ Tus notas:"]
-            for r in rows:
-                lines.append(f"• {r['content']}")
-            reply = "\n".join(lines)
+        elif result["type"] == "list_notes":
+            rows = conn.execute(
+                "SELECT content, created_at FROM notes WHERE phone = ? ORDER BY id DESC LIMIT 20",
+                (phone,),
+            ).fetchall()
+            if not rows:
+                reply = "Todavía no tienes notas guardadas."
+            else:
+                lines = ["🗒️ Tus notas:"]
+                for r in rows:
+                    lines.append(f"• {r['content']}")
+                reply = "\n".join(lines)
 
-    else:  # question
-        try:
-            reply = answer_general_question(phone, incoming_msg)
-        except Exception as e:
-            print(f"Error respondiendo pregunta general: {e}")
-            reply = "⚠️ Tuve un problema pensando la respuesta (el servicio de IA no respondió). Intenta de nuevo en un momento."
+        else:  # question
+            try:
+                reply = answer_general_question(phone, incoming_msg)
+            except Exception as e:
+                print(f"Error respondiendo pregunta general: {e}")
+                reply = "⚠️ Tuve un problema pensando la respuesta (el servicio de IA no respondió). Intenta de nuevo en un momento."
+    except Exception as e:
+        print(f"Error inesperado procesando el mensaje: {e}")
+        reply = "⚠️ Tuve un problema procesando tu mensaje. Intenta de nuevo en un momento."
+    finally:
+        conn.close()
 
-    conn.close()
     send_whatsapp(phone, reply)
 
 
