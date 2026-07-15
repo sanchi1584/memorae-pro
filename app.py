@@ -90,7 +90,7 @@ La fecha y hora actual es {{now}} (zona horaria {APP_TIMEZONE}).
 Dado un mensaje del usuario, responde SOLO con un JSON (sin texto adicional, sin markdown) con esta forma exacta:
 
 {{{{
-  "type": "reminder" | "note" | "list_reminders" | "list_notes" | "question",
+  "type": "reminder" | "note" | "list_reminders" | "list_notes" | "delete_reminders" | "delete_notes" | "question",
   "content": "texto limpio del recordatorio o nota (null si no aplica)",
   "due_at": "fecha y hora en formato ISO 8601 con zona horaria del PRIMER (o único) aviso, o null si no aplica",
   "occurrences": ["fecha y hora ISO 8601 de cada aviso adicional"] o null si es un recordatorio de una sola vez,
@@ -102,15 +102,18 @@ Reglas:
 - "note": el usuario quiere guardar información sin fecha de aviso (ej. "anota que mi talla de zapato es 9").
 - "list_reminders": el usuario pide ver sus recordatorios pendientes.
 - "list_notes": el usuario pide ver sus notas guardadas.
+- "delete_reminders": el usuario pide borrar/eliminar/limpiar TODOS sus recordatorios (ej. "elimina todos los recordatorios", "borra mis recordatorios").
+- "delete_notes": el usuario pide borrar/eliminar/limpiar TODAS sus notas guardadas.
 - "question": cualquier otra cosa, incluyendo preguntas generales tipo chat.
 - Si el usuario da una hora relativa ("en 2 horas", "mañana", "el viernes"), calcula la fecha absoluta usando la fecha/hora actual dada arriba.
 - Si es "reminder" pero no dio ninguna indicación de tiempo, trátalo como "note" en vez de "reminder".
 - RECORDATORIOS RECURRENTES: si el usuario pide que se repita ("todos los días", "de lunes a viernes",
   "hasta el viernes", "cada día a partir de mañana"), calcula TODAS las fechas/horas concretas dentro del
   rango que haya indicado (excluyendo fines de semana solo si el usuario lo pidió explícitamente) y ponlas
-  en "occurrences" (la primera fecha va en "due_at", el resto en "occurrences"). Si el usuario no puso una
-  fecha final ("todos los días" sin decir hasta cuándo), asume un límite razonable de 14 días desde hoy.
-  Nunca generes más de 30 fechas en total.
+  en "occurrences", SIN REPETIR NINGUNA FECHA (una sola vez por día). La primera fecha va en "due_at" y el
+  resto (una por cada día restante) en "occurrences". Si el usuario no puso una fecha final ("todos los
+  días" sin decir hasta cuándo), asume un límite razonable de 14 días desde hoy. Nunca generes más de 30
+  fechas en total, y nunca repitas la misma fecha/hora dos veces.
 - "fact_to_remember" se aplica SIN IMPORTAR el "type": aunque el mensaje sea una pregunta o un comentario casual,
   si menciona algo duradero sobre el usuario (ej. "me llamo Santiago", "vivo en Buenos Aires", "no me gusta el picante"),
   extráelo aquí. Si el mensaje no aporta ningún dato nuevo sobre el usuario, deja este campo en null.
@@ -269,13 +272,27 @@ def process_and_reply(phone: str, incoming_msg: str):
 
         if result["type"] == "reminder" and result.get("due_at"):
             all_dates = [result["due_at"]] + [d for d in (result.get("occurrences") or []) if d]
-            # Tope de seguridad: nunca más de 30 avisos de una sola vez
-            all_dates = all_dates[:30]
+            # Quitamos fechas duplicadas (por si el modelo repitió alguna) y limitamos a 30
+            seen = set()
+            unique_dates = []
+            for d in all_dates:
+                if d not in seen:
+                    seen.add(d)
+                    unique_dates.append(d)
+            all_dates = unique_dates[:30]
+
+            inserted = 0
             for due_at in all_dates:
-                conn.execute(
-                    "INSERT INTO reminders (phone, content, due_at, created_at) VALUES (?, ?, ?, ?)",
-                    (phone, result["content"], due_at, now_iso),
-                )
+                exists = conn.execute(
+                    "SELECT 1 FROM reminders WHERE phone = ? AND content = ? AND due_at = ? AND sent = 0",
+                    (phone, result["content"], due_at),
+                ).fetchone()
+                if not exists:
+                    conn.execute(
+                        "INSERT INTO reminders (phone, content, due_at, created_at) VALUES (?, ?, ?, ?)",
+                        (phone, result["content"], due_at, now_iso),
+                    )
+                    inserted += 1
             conn.commit()
             first_dt = datetime.fromisoformat(all_dates[0])
             if len(all_dates) > 1:
@@ -322,6 +339,16 @@ def process_and_reply(phone: str, incoming_msg: str):
                 for r in rows:
                     lines.append(f"• {r['content']}")
                 reply = "\n".join(lines)
+
+        elif result["type"] == "delete_reminders":
+            cur = conn.execute("DELETE FROM reminders WHERE phone = ?", (phone,))
+            conn.commit()
+            reply = f"🗑️ Listo, borré {cur.rowcount} recordatorio(s)." if cur.rowcount else "No tenías recordatorios para borrar."
+
+        elif result["type"] == "delete_notes":
+            cur = conn.execute("DELETE FROM notes WHERE phone = ?", (phone,))
+            conn.commit()
+            reply = f"🗑️ Listo, borré {cur.rowcount} nota(s)." if cur.rowcount else "No tenías notas para borrar."
 
         else:  # question
             try:
