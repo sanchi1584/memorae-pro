@@ -90,10 +90,12 @@ La fecha y hora actual es {{now}} (zona horaria {APP_TIMEZONE}).
 Dado un mensaje del usuario, responde SOLO con un JSON (sin texto adicional, sin markdown) con esta forma exacta:
 
 {{{{
-  "type": "reminder" | "note" | "list_reminders" | "list_notes" | "delete_reminders" | "delete_notes" | "question",
+  "type": "reminder" | "note" | "list_reminders" | "list_notes" | "delete_reminders" | "delete_notes" | "delete_specific_reminder" | "edit_reminder" | "question",
   "content": "texto limpio del recordatorio o nota (null si no aplica)",
   "due_at": "fecha y hora en formato ISO 8601 con zona horaria del PRIMER (o único) aviso, o null si no aplica",
   "occurrences": ["fecha y hora ISO 8601 de cada aviso adicional"] o null si es un recordatorio de una sola vez,
+  "target_hint": "para delete_specific_reminder o edit_reminder: unas pocas palabras clave del recordatorio al que se refiere el usuario (ej. 'correr', 'llamar al doctor'), o null si no aplica",
+  "new_due_at": "para edit_reminder: la nueva fecha/hora en ISO 8601, o null si no aplica",
   "fact_to_remember": "un dato personal duradero sobre el usuario mencionado en el mensaje (nombre, gustos, trabajo, relaciones, preferencias, etc.), en pocas palabras y en tercera persona, o null si no hay ningún dato nuevo que valga la pena recordar"
 }}}}
 
@@ -102,9 +104,13 @@ Reglas:
 - "note": el usuario quiere guardar información sin fecha de aviso (ej. "anota que mi talla de zapato es 9").
 - "list_reminders": el usuario pide ver sus recordatorios pendientes.
 - "list_notes": el usuario pide ver sus notas guardadas.
-- "delete_reminders": el usuario pide borrar/eliminar/limpiar TODOS sus recordatorios (ej. "elimina todos los recordatorios", "borra mis recordatorios").
+- "delete_reminders": el usuario pide borrar/eliminar/limpiar TODOS sus recordatorios (ej. "elimina todos los recordatorios").
 - "delete_notes": el usuario pide borrar/eliminar/limpiar TODAS sus notas guardadas.
-- "question": cualquier otra cosa, incluyendo preguntas generales tipo chat.
+- "delete_specific_reminder": el usuario pide borrar UN recordatorio puntual, no todos (ej. "borra el recordatorio de correr",
+  "cancela el aviso de llamar al doctor"). Pon en "target_hint" las palabras clave para identificarlo.
+- "edit_reminder": el usuario pide cambiar la hora/fecha de un recordatorio existente (ej. "cambia el de correr para las 9am",
+  "mueve el recordatorio del informe al viernes"). Pon en "target_hint" las palabras clave, y en "new_due_at" la nueva fecha/hora.
+- "question": cualquier otra cosa, incluyendo preguntas generales tipo chat (incluye buscar en notas, ej. "¿qué anoté sobre el auto?").
 - Si el usuario da una hora relativa ("en 2 horas", "mañana", "el viernes"), calcula la fecha absoluta usando la fecha/hora actual dada arriba.
 - Si es "reminder" pero no dio ninguna indicación de tiempo, trátalo como "note" en vez de "reminder".
 - RECORDATORIOS RECURRENTES: si el usuario pide que se repita ("todos los días", "de lunes a viernes",
@@ -357,6 +363,48 @@ def process_and_reply(phone: str, incoming_msg: str):
             cur = conn.execute("DELETE FROM notes WHERE phone = ?", (phone,))
             conn.commit()
             reply = f"🗑️ Listo, borré {cur.rowcount} nota(s)." if cur.rowcount else "No tenías notas para borrar."
+
+        elif result["type"] == "delete_specific_reminder":
+            hint = (result.get("target_hint") or "").strip()
+            matches = conn.execute(
+                "SELECT id, content, due_at FROM reminders WHERE phone = ? AND sent = 0 AND content LIKE ? ORDER BY due_at ASC",
+                (phone, f"%{hint}%"),
+            ).fetchall() if hint else []
+
+            if not matches:
+                reply = f"No encontré ningún recordatorio pendiente relacionado con \"{hint}\". Decime \"¿qué recordatorios tengo?\" para ver la lista completa."
+            elif len(matches) == 1:
+                conn.execute("DELETE FROM reminders WHERE id = ?", (matches[0]["id"],))
+                conn.commit()
+                d = datetime.fromisoformat(matches[0]["due_at"])
+                reply = f"🗑️ Borré: \"{matches[0]['content']}\" — {d.strftime('%d/%m %H:%M')}"
+            else:
+                conn.execute(
+                    "DELETE FROM reminders WHERE phone = ? AND sent = 0 AND content LIKE ?",
+                    (phone, f"%{hint}%"),
+                )
+                conn.commit()
+                reply = f"🗑️ Encontré {len(matches)} recordatorios relacionados con \"{hint}\" y los borré todos."
+
+        elif result["type"] == "edit_reminder":
+            hint = (result.get("target_hint") or "").strip()
+            new_due_at = result.get("new_due_at")
+            matches = conn.execute(
+                "SELECT id, content, due_at FROM reminders WHERE phone = ? AND sent = 0 AND content LIKE ? ORDER BY due_at ASC",
+                (phone, f"%{hint}%"),
+            ).fetchall() if hint else []
+
+            if not new_due_at:
+                reply = "No entendí bien a qué hora querés moverlo. ¿Podés decirlo de nuevo con la fecha/hora exacta?"
+            elif not matches:
+                reply = f"No encontré ningún recordatorio pendiente relacionado con \"{hint}\"."
+            elif len(matches) > 1:
+                reply = f"Encontré {len(matches)} recordatorios relacionados con \"{hint}\" — decime cuál más específicamente."
+            else:
+                conn.execute("UPDATE reminders SET due_at = ? WHERE id = ?", (new_due_at, matches[0]["id"]))
+                conn.commit()
+                d = datetime.fromisoformat(new_due_at)
+                reply = f"✅ Listo, moví \"{matches[0]['content']}\" para el {d.strftime('%d/%m/%Y %H:%M')}"
 
         else:  # question
             try:
