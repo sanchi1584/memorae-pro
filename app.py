@@ -568,7 +568,7 @@ def check_due_reminders():
     conn.close()
 
 
-def send_daily_summaries():
+def send_daily_summaries(7):
     """Cada mañana (a la hora configurada), le manda a cada usuario con
     recordatorios pendientes para hoy un resumen único con todo lo que tiene."""
     conn = get_db()
