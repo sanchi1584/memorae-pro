@@ -34,6 +34,8 @@ APP_TIMEZONE = os.environ.get("APP_TIMEZONE", "America/Mexico_City")
 DB_PATH = os.environ.get("DB_PATH", "memorae.db")
 GEMINI_MODEL = "gemini-flash-lite-latest"
 DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR", "8"))
+WEATHER_LAT = os.environ.get("WEATHER_LAT", "-26.78")
+WEATHER_LON = os.environ.get("WEATHER_LON", "-55.03")
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -108,7 +110,7 @@ La fecha y hora actual es {{now}} (zona horaria {APP_TIMEZONE}).
 Dado un mensaje del usuario, responde SOLO con un JSON (sin texto adicional, sin markdown) con esta forma exacta:
 
 {{{{
-  "type": "reminder" | "note" | "list_reminders" | "list_notes" | "delete_reminders" | "delete_notes" | "delete_specific_reminder" | "edit_reminder" | "postpone" | "question",
+  "type": "reminder" | "note" | "list_reminders" | "list_notes" | "delete_reminders" | "delete_notes" | "delete_specific_reminder" | "edit_reminder" | "postpone" | "complete_reminder" | "question",
   "content": "texto limpio del recordatorio o nota (null si no aplica)",
   "due_at": "fecha y hora en formato ISO 8601 con zona horaria del PRIMER (o único) aviso, o null si no aplica",
   "occurrences": ["fecha y hora ISO 8601 de cada aviso adicional"] o null si es un recordatorio de una sola vez,
@@ -131,6 +133,8 @@ Reglas:
   "mueve el recordatorio del informe al viernes"). Pon en "target_hint" las palabras clave, y en "new_due_at" la nueva fecha/hora.
 - "postpone": el usuario pide posponer/aplazar/dejar para más tarde el recordatorio que acaba de sonar (ej. "posponer 10 min",
   "avisame en 15 minutos mejor", "dale, en un rato"). Pon el número de minutos en "postpone_minutes".
+- "complete_reminder": el usuario avisa que ya hizo/completó algo pendiente, sin esperar a que suene el recordatorio
+  (ej. "ya llamé al doctor", "listo, ya hice lo de correr", "hecho lo del informe"). Pon en "target_hint" las palabras clave.
 - "question": cualquier otra cosa, incluyendo preguntas generales tipo chat (incluye buscar en notas, ej. "¿qué anoté sobre el auto?").
 - Si el usuario da una hora relativa ("en 2 horas", "mañana", "el viernes"), calcula la fecha absoluta usando la fecha/hora actual dada arriba.
 - Si es "reminder" pero no dio ninguna indicación de tiempo, trátalo como "note" en vez de "reminder".
@@ -485,6 +489,27 @@ def process_and_reply(phone: str, incoming_msg: str, media_url: str = None, medi
                 conn.commit()
                 reply = f"⏳ Listo, te lo vuelvo a recordar en {minutes} minutos: \"{last['content']}\""
 
+        elif result["type"] == "complete_reminder":
+            hint = (result.get("target_hint") or "").strip()
+            matches = conn.execute(
+                "SELECT id, content FROM reminders WHERE phone = ? AND sent = 0 AND content LIKE ? ORDER BY due_at ASC",
+                (phone, f"%{hint}%"),
+            ).fetchall() if hint else []
+
+            if not matches:
+                reply = f"No encontré ningún recordatorio pendiente relacionado con \"{hint}\"."
+            elif len(matches) == 1:
+                conn.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (matches[0]["id"],))
+                conn.commit()
+                reply = f"✅ ¡Buenísimo! Marqué como hecho: \"{matches[0]['content']}\""
+            else:
+                conn.execute(
+                    "UPDATE reminders SET sent = 1 WHERE phone = ? AND sent = 0 AND content LIKE ?",
+                    (phone, f"%{hint}%"),
+                )
+                conn.commit()
+                reply = f"✅ Marqué como hechos los {len(matches)} recordatorios relacionados con \"{hint}\"."
+
         else:  # question
             try:
                 reply = answer_general_question(phone, incoming_msg)
@@ -568,7 +593,41 @@ def check_due_reminders():
     conn.close()
 
 
-def send_daily_summaries(7):
+WEATHER_CODE_DESCRIPTIONS = {
+    0: ("☀️", "despejado"), 1: ("🌤️", "mayormente despejado"), 2: ("⛅", "parcialmente nublado"),
+    3: ("☁️", "nublado"), 45: ("🌫️", "neblina"), 48: ("🌫️", "neblina con escarcha"),
+    51: ("🌦️", "llovizna ligera"), 53: ("🌦️", "llovizna"), 55: ("🌧️", "llovizna densa"),
+    61: ("🌧️", "lluvia ligera"), 63: ("🌧️", "lluvia"), 65: ("🌧️", "lluvia fuerte"),
+    71: ("🌨️", "nieve ligera"), 73: ("🌨️", "nieve"), 75: ("❄️", "nieve fuerte"),
+    80: ("🌦️", "chubascos ligeros"), 81: ("🌧️", "chubascos"), 82: ("⛈️", "chubascos fuertes"),
+    95: ("⛈️", "tormenta"), 96: ("⛈️", "tormenta con granizo"), 99: ("⛈️", "tormenta fuerte con granizo"),
+}
+
+
+def get_weather_summary() -> str | None:
+    """Consulta el clima actual con Open-Meteo (gratis, sin API key)."""
+    try:
+        resp = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": WEATHER_LAT,
+                "longitude": WEATHER_LON,
+                "current": "temperature_2m,weather_code",
+                "timezone": "auto",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        current = resp.json()["current"]
+        temp = round(current["temperature_2m"])
+        emoji, desc = WEATHER_CODE_DESCRIPTIONS.get(current["weather_code"], ("🌡️", "condiciones variables"))
+        return f"{emoji} {temp}°C, {desc}"
+    except Exception as e:
+        print(f"Error consultando el clima: {e}")
+        return None
+
+
+def send_daily_summaries():
     """Cada mañana (a la hora configurada), le manda a cada usuario con
     recordatorios pendientes para hoy un resumen único con todo lo que tiene."""
     conn = get_db()
@@ -576,6 +635,8 @@ def send_daily_summaries(7):
     phones = conn.execute(
         "SELECT DISTINCT phone FROM reminders WHERE sent = 0"
     ).fetchall()
+
+    weather = get_weather_summary()
 
     for row in phones:
         phone = row["phone"]
@@ -586,6 +647,9 @@ def send_daily_summaries(7):
         if not todays:
             continue
         lines = ["☀️ ¡Buenos días! Esto es lo que tenés para hoy:"]
+        if weather:
+            lines.append(f"Clima: {weather}")
+            lines.append("")
         for r in todays:
             d = datetime.fromisoformat(r["due_at"])
             lines.append(f"• {r['content']} — {d.strftime('%H:%M')}")
@@ -603,6 +667,97 @@ scheduler.start()
 @app.route("/health", methods=["GET"])
 def health():
     return {"status": "ok", "time": datetime.now(tz).isoformat()}
+
+
+DASHBOARD_TOKEN = os.environ.get("DASHBOARD_TOKEN", "")
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mis recordatorios y notas</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background: #f4f4f5; margin: 0; padding: 24px; color: #1a1a1a; }
+  h1 { font-size: 1.4rem; margin-bottom: 4px; }
+  .subtitle { color: #666; margin-bottom: 24px; font-size: 0.9rem; }
+  .card { background: white; border-radius: 12px; padding: 16px 20px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+  .card h2 { font-size: 1.05rem; margin: 0 0 12px 0; }
+  ul { list-style: none; padding: 0; margin: 0; }
+  li { padding: 10px 0; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; gap: 12px; }
+  li:last-child { border-bottom: none; }
+  .content { flex: 1; }
+  .meta { color: #888; font-size: 0.85rem; white-space: nowrap; }
+  .empty { color: #999; font-style: italic; padding: 8px 0; }
+  select { margin-bottom: 16px; padding: 6px 10px; border-radius: 8px; border: 1px solid #ddd; }
+</style>
+</head>
+<body>
+  <h1>📱 Memorae Pro</h1>
+  <div class="subtitle">Actualizado: {{ now }}</div>
+
+  <div class="card">
+    <h2>📌 Recordatorios pendientes ({{ reminders|length }})</h2>
+    {% if reminders %}
+    <ul>
+      {% for r in reminders %}
+      <li><span class="content">{{ r.content }}</span><span class="meta">{{ r.due_at }}</span></li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <div class="empty">No tenés recordatorios pendientes.</div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>🗒️ Notas guardadas ({{ notes|length }})</h2>
+    {% if notes %}
+    <ul>
+      {% for n in notes %}
+      <li><span class="content">{{ n.content }}</span><span class="meta">{{ n.created_at }}</span></li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <div class="empty">No tenés notas guardadas.</div>
+    {% endif %}
+  </div>
+</body>
+</html>"""
+
+
+@app.route("/dashboard", methods=["GET"])
+def dashboard():
+    if not DASHBOARD_TOKEN or request.args.get("token") != DASHBOARD_TOKEN:
+        return "No autorizado. Falta el token correcto en la URL (?token=...).", 401
+
+    phone = request.args.get("phone", "")
+    conn = get_db()
+
+    if phone:
+        reminders = conn.execute(
+            "SELECT content, due_at FROM reminders WHERE phone = ? AND sent = 0 ORDER BY due_at ASC",
+            (phone,),
+        ).fetchall()
+        notes = conn.execute(
+            "SELECT content, created_at FROM notes WHERE phone = ? ORDER BY id DESC",
+            (phone,),
+        ).fetchall()
+    else:
+        reminders = conn.execute(
+            "SELECT content, due_at FROM reminders WHERE sent = 0 ORDER BY due_at ASC"
+        ).fetchall()
+        notes = conn.execute(
+            "SELECT content, created_at FROM notes ORDER BY id DESC"
+        ).fetchall()
+    conn.close()
+
+    from flask import render_template_string
+    return render_template_string(
+        DASHBOARD_HTML,
+        reminders=reminders,
+        notes=notes,
+        now=datetime.now(tz).strftime("%d/%m/%Y %H:%M"),
+    )
 
 
 if __name__ == "__main__":
