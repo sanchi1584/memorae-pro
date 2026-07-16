@@ -33,9 +33,10 @@ TWILIO_WHATSAPP_NUMBER = os.environ["TWILIO_WHATSAPP_NUMBER"]  # ej: whatsapp:+1
 APP_TIMEZONE = os.environ.get("APP_TIMEZONE", "America/Mexico_City")
 DB_PATH = os.environ.get("DB_PATH", "memorae.db")
 GEMINI_MODEL = "gemini-flash-lite-latest"
-DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR", "8"))
-WEATHER_LAT = os.environ.get("WEATHER_LAT", "-26.78")
-WEATHER_LON = os.environ.get("WEATHER_LON", "-55.03")
+DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR", "6"))
+DAILY_SUMMARY_MINUTE = int(os.environ.get("DAILY_SUMMARY_MINUTE", "30"))
+WEATHER_LAT = os.environ.get("WEATHER_LAT", "-26.7825")
+WEATHER_LON = os.environ.get("WEATHER_LON", "-55.0339")
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -162,9 +163,9 @@ La fecha y hora actual es {now} (zona horaria {tzname}).
 Respondes preguntas generales con claridad y brevedad, en el mismo idioma en que te escriben.
 Si te preguntan la hora, la fecha, o el día de la semana, respóndelo directamente usando el dato de arriba.
 
-Tenés acceso a Google Search en tiempo real. Para preguntas sobre noticias, resultados deportivos,
-precios, clima, o cualquier cosa que pueda haber cambiado recientemente, buscá información actual
-antes de responder en vez de adivinar. No digas que no tenés acceso a internet: si lo tenés.
+No tenés acceso a internet en tiempo real. Para preguntas sobre noticias, resultados deportivos,
+precios actuales, o cualquier cosa que pueda haber cambiado recientemente, aclará que no tenés
+información actualizada al respecto en vez de inventar una respuesta.
 
 Información importante sobre cómo funcionás en realidad (para responder bien si te preguntan):
 - Cuando el usuario te pide un recordatorio, un sistema automático revisa cada minuto si ya llegó la hora,
@@ -181,13 +182,11 @@ si la pregunta se relaciona con algo que ya te contó (por ejemplo, "¿cuál es 
 Si la respuesta no está en las notas ni la sabes con certeza (ni buscando), dilo honestamente."""
 
 
-def call_gemini(system_instruction: str, contents: list, max_retries: int = 3, use_search: bool = False) -> str:
+def call_gemini(system_instruction: str, contents: list, max_retries: int = 3) -> str:
     """Llama a la API REST de Gemini directamente (sin SDK pesado).
     Reintenta automáticamente si el servicio está saturado (503) o si se
     excedió el límite de solicitudes por minuto (429), con esperas más
-    largas para el 429 (que necesita que se libere la cuota del minuto).
-    Si use_search=True, activa "Grounding con Google Search" para preguntas
-    que necesiten información actual (noticias, resultados deportivos, etc.)."""
+    largas para el 429 (que necesita que se libere la cuota del minuto)."""
     payload = {
         "system_instruction": {"parts": [{"text": system_instruction}]},
         "contents": contents,
@@ -196,8 +195,6 @@ def call_gemini(system_instruction: str, contents: list, max_retries: int = 3, u
             "maxOutputTokens": 500,
         },
     }
-    if use_search:
-        payload["tools"] = [{"google_search": {}}]
 
     last_error = None
     for attempt in range(max_retries + 1):
@@ -307,7 +304,7 @@ def answer_general_question(phone: str, user_message: str) -> str:
     now_str = datetime.now(tz).strftime("%A %d de %B de %Y, %H:%M")
     notes_text = "\n".join(f"- {r['content']}" for r in note_rows) if note_rows else "(el usuario no tiene notas guardadas todavía)"
     system = CHAT_SYSTEM_PROMPT.format(now=now_str, tzname=APP_TIMEZONE, notes=notes_text)
-    reply = call_gemini(system, contents, use_search=True).strip()
+    reply = call_gemini(system, contents).strip()
 
     conn = get_db()
     now_iso = datetime.now(tz).isoformat()
@@ -697,13 +694,22 @@ def send_daily_summaries():
 
 scheduler = BackgroundScheduler(timezone=str(tz))
 scheduler.add_job(check_due_reminders, "interval", minutes=1)
-scheduler.add_job(send_daily_summaries, "cron", hour=DAILY_SUMMARY_HOUR, minute=0)
+scheduler.add_job(send_daily_summaries, "cron", hour=DAILY_SUMMARY_HOUR, minute=DAILY_SUMMARY_MINUTE)
 scheduler.start()
 
 
 @app.route("/health", methods=["GET"])
 def health():
     return {"status": "ok", "time": datetime.now(tz).isoformat()}
+
+
+@app.route("/trigger-daily-summary", methods=["GET"])
+def trigger_daily_summary():
+    """Ruta manual para probar el resumen diario sin esperar a la hora programada."""
+    if not DASHBOARD_TOKEN or request.args.get("token") != DASHBOARD_TOKEN:
+        return "No autorizado. Falta el token correcto en la URL (?token=...).", 401
+    send_daily_summaries()
+    return {"status": "ok", "message": "Resumen diario disparado manualmente"}
 
 
 DASHBOARD_TOKEN = os.environ.get("DASHBOARD_TOKEN", "")
