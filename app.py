@@ -107,14 +107,17 @@ def init_db():
 CLASSIFIER_SYSTEM_PROMPT = f"""Eres el motor de clasificación de un asistente de memoria por WhatsApp.
 La fecha y hora actual es {{now}} (zona horaria {APP_TIMEZONE}).
 
+Estos son los recordatorios PENDIENTES del usuario ahora mismo (id: contenido — fecha/hora):
+{{pending_reminders}}
+
 Dado un mensaje del usuario, responde SOLO con un JSON (sin texto adicional, sin markdown) con esta forma exacta:
 
 {{{{
-  "type": "reminder" | "note" | "list_reminders" | "list_notes" | "delete_reminders" | "delete_notes" | "delete_specific_reminder" | "edit_reminder" | "postpone" | "complete_reminder" | "question",
+  "type": "reminder" | "note" | "list_reminders" | "list_notes" | "delete_reminders" | "delete_notes" | "delete_specific_reminder" | "edit_reminder" | "postpone" | "complete_reminder" | "help" | "stats" | "question",
   "content": "texto limpio del recordatorio o nota (null si no aplica)",
   "due_at": "fecha y hora en formato ISO 8601 con zona horaria del PRIMER (o único) aviso, o null si no aplica",
   "occurrences": ["fecha y hora ISO 8601 de cada aviso adicional"] o null si es un recordatorio de una sola vez,
-  "target_hint": "para delete_specific_reminder o edit_reminder: unas pocas palabras clave del recordatorio al que se refiere el usuario (ej. 'correr', 'llamar al doctor'), o null si no aplica",
+  "target_ids": [lista de IDs (enteros) de la lista de recordatorios pendientes de arriba a los que se refiere el usuario, usando tu criterio semántico aunque las palabras no coincidan textualmente (ej. "ya me bañé" se refiere a un recordatorio "ir a bañarme"). Lista vacía si no aplica o no encontrás ninguno],
   "new_due_at": "para edit_reminder: la nueva fecha/hora en ISO 8601, o null si no aplica",
   "postpone_minutes": "para postpone: cuántos minutos posponer (número entero; si dice 'un rato' sin especificar, usa 10), o null si no aplica",
   "fact_to_remember": "un dato personal duradero sobre el usuario mencionado en el mensaje (nombre, gustos, trabajo, relaciones, preferencias, etc.), en pocas palabras y en tercera persona, o null si no hay ningún dato nuevo que valga la pena recordar"
@@ -128,13 +131,15 @@ Reglas:
 - "delete_reminders": el usuario pide borrar/eliminar/limpiar TODOS sus recordatorios (ej. "elimina todos los recordatorios").
 - "delete_notes": el usuario pide borrar/eliminar/limpiar TODAS sus notas guardadas.
 - "delete_specific_reminder": el usuario pide borrar UN recordatorio puntual, no todos (ej. "borra el recordatorio de correr",
-  "cancela el aviso de llamar al doctor"). Pon en "target_hint" las palabras clave para identificarlo.
+  "cancela el aviso de llamar al doctor"). Identificá cuál es usando la lista de pendientes de arriba y poné su id en "target_ids".
 - "edit_reminder": el usuario pide cambiar la hora/fecha de un recordatorio existente (ej. "cambia el de correr para las 9am",
-  "mueve el recordatorio del informe al viernes"). Pon en "target_hint" las palabras clave, y en "new_due_at" la nueva fecha/hora.
+  "mueve el recordatorio del informe al viernes"). Poné el id en "target_ids" (solo uno), y en "new_due_at" la nueva fecha/hora.
 - "postpone": el usuario pide posponer/aplazar/dejar para más tarde el recordatorio que acaba de sonar (ej. "posponer 10 min",
   "avisame en 15 minutos mejor", "dale, en un rato"). Pon el número de minutos en "postpone_minutes".
 - "complete_reminder": el usuario avisa que ya hizo/completó algo pendiente, sin esperar a que suene el recordatorio
-  (ej. "ya llamé al doctor", "listo, ya hice lo de correr", "hecho lo del informe"). Pon en "target_hint" las palabras clave.
+  (ej. "ya llamé al doctor", "listo, ya hice lo de correr", "ya me bañé" cuando hay un pendiente "ir a bañarme").
+  Usá tu criterio semántico para identificar CUÁL de los pendientes de arriba corresponde, aunque las palabras no
+  coincidan exactamente (conjugaciones distintas, sinónimos, etc.), y poné su id en "target_ids".
 - "question": cualquier otra cosa, incluyendo preguntas generales tipo chat (incluye buscar en notas, ej. "¿qué anoté sobre el auto?").
 - Si el usuario da una hora relativa ("en 2 horas", "mañana", "el viernes"), calcula la fecha absoluta usando la fecha/hora actual dada arriba.
 - Si es "reminder" pero no dio ninguna indicación de tiempo, trátalo como "note" en vez de "reminder".
@@ -157,6 +162,10 @@ La fecha y hora actual es {now} (zona horaria {tzname}).
 Respondes preguntas generales con claridad y brevedad, en el mismo idioma en que te escriben.
 Si te preguntan la hora, la fecha, o el día de la semana, respóndelo directamente usando el dato de arriba.
 
+Tenés acceso a Google Search en tiempo real. Para preguntas sobre noticias, resultados deportivos,
+precios, clima, o cualquier cosa que pueda haber cambiado recientemente, buscá información actual
+antes de responder en vez de adivinar. No digas que no tenés acceso a internet: si lo tenés.
+
 Información importante sobre cómo funcionás en realidad (para responder bien si te preguntan):
 - Cuando el usuario te pide un recordatorio, un sistema automático revisa cada minuto si ya llegó la hora,
   y en ese momento te manda un mensaje de WhatsApp SOLO, sin que el usuario tenga que pedirlo de nuevo.
@@ -169,14 +178,16 @@ Estas son las notas que el usuario te ha pedido guardar anteriormente. Úsalas p
 si la pregunta se relaciona con algo que ya te contó (por ejemplo, "¿cuál es mi color favorito?"):
 {notes}
 
-Si la respuesta no está en las notas ni la sabes con certeza, dilo honestamente."""
+Si la respuesta no está en las notas ni la sabes con certeza (ni buscando), dilo honestamente."""
 
 
-def call_gemini(system_instruction: str, contents: list, max_retries: int = 3) -> str:
+def call_gemini(system_instruction: str, contents: list, max_retries: int = 3, use_search: bool = False) -> str:
     """Llama a la API REST de Gemini directamente (sin SDK pesado).
     Reintenta automáticamente si el servicio está saturado (503) o si se
     excedió el límite de solicitudes por minuto (429), con esperas más
-    largas para el 429 (que necesita que se libere la cuota del minuto)."""
+    largas para el 429 (que necesita que se libere la cuota del minuto).
+    Si use_search=True, activa "Grounding con Google Search" para preguntas
+    que necesiten información actual (noticias, resultados deportivos, etc.)."""
     payload = {
         "system_instruction": {"parts": [{"text": system_instruction}]},
         "contents": contents,
@@ -185,6 +196,8 @@ def call_gemini(system_instruction: str, contents: list, max_retries: int = 3) -
             "maxOutputTokens": 500,
         },
     }
+    if use_search:
+        payload["tools"] = [{"google_search": {}}]
 
     last_error = None
     for attempt in range(max_retries + 1):
@@ -252,9 +265,15 @@ def describe_media(media_url: str, content_type: str) -> str:
     return call_gemini("Eres un transcriptor/descriptor preciso y conciso.", contents).strip()
 
 
-def classify_message(user_message: str) -> dict:
+def classify_message(user_message: str, pending_reminders: list) -> dict:
     now_str = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %Z")
-    system = CLASSIFIER_SYSTEM_PROMPT.format(now=now_str)
+    if pending_reminders:
+        pending_text = "\n".join(
+            f"- id {r['id']}: {r['content']} — {r['due_at']}" for r in pending_reminders
+        )
+    else:
+        pending_text = "(el usuario no tiene recordatorios pendientes ahora mismo)"
+    system = CLASSIFIER_SYSTEM_PROMPT.format(now=now_str, pending_reminders=pending_text)
 
     contents = [{"role": "user", "parts": [{"text": user_message}]}]
     raw = call_gemini(system, contents).strip()
@@ -288,7 +307,7 @@ def answer_general_question(phone: str, user_message: str) -> str:
     now_str = datetime.now(tz).strftime("%A %d de %B de %Y, %H:%M")
     notes_text = "\n".join(f"- {r['content']}" for r in note_rows) if note_rows else "(el usuario no tiene notas guardadas todavía)"
     system = CHAT_SYSTEM_PROMPT.format(now=now_str, tzname=APP_TIMEZONE, notes=notes_text)
-    reply = call_gemini(system, contents).strip()
+    reply = call_gemini(system, contents, use_search=True).strip()
 
     conn = get_db()
     now_iso = datetime.now(tz).isoformat()
@@ -323,7 +342,18 @@ def process_and_reply(phone: str, incoming_msg: str, media_url: str = None, medi
         incoming_msg = f"{incoming_msg}\n{media_text}".strip() if incoming_msg else media_text
 
     try:
-        result = classify_message(incoming_msg)
+        conn_lookup = get_db()
+        pending_reminders = conn_lookup.execute(
+            "SELECT id, content, due_at FROM reminders WHERE phone = ? AND sent = 0 ORDER BY due_at ASC",
+            (phone,),
+        ).fetchall()
+        conn_lookup.close()
+    except Exception as e:
+        print(f"Error obteniendo recordatorios pendientes: {e}")
+        pending_reminders = []
+
+    try:
+        result = classify_message(incoming_msg, pending_reminders)
     except Exception as e:
         print(f"Error clasificando mensaje: {e}")
         send_whatsapp(phone, "⚠️ Tuve un problema entendiendo tu mensaje (el servicio de IA no respondió). Intenta de nuevo en un momento.")
@@ -432,46 +462,51 @@ def process_and_reply(phone: str, incoming_msg: str, media_url: str = None, medi
             reply = f"🗑️ Listo, borré {cur.rowcount} nota(s)." if cur.rowcount else "No tenías notas para borrar."
 
         elif result["type"] == "delete_specific_reminder":
-            hint = (result.get("target_hint") or "").strip()
-            matches = conn.execute(
-                "SELECT id, content, due_at FROM reminders WHERE phone = ? AND sent = 0 AND content LIKE ? ORDER BY due_at ASC",
-                (phone, f"%{hint}%"),
-            ).fetchall() if hint else []
-
-            if not matches:
-                reply = f"No encontré ningún recordatorio pendiente relacionado con \"{hint}\". Decime \"¿qué recordatorios tengo?\" para ver la lista completa."
-            elif len(matches) == 1:
-                conn.execute("DELETE FROM reminders WHERE id = ?", (matches[0]["id"],))
-                conn.commit()
-                d = datetime.fromisoformat(matches[0]["due_at"])
-                reply = f"🗑️ Borré: \"{matches[0]['content']}\" — {d.strftime('%d/%m %H:%M')}"
+            ids = [i for i in (result.get("target_ids") or []) if isinstance(i, int)]
+            if not ids:
+                reply = "No identifiqué a cuál recordatorio te referís. Decime \"¿qué recordatorios tengo?\" para ver la lista completa."
             else:
-                conn.execute(
-                    "DELETE FROM reminders WHERE phone = ? AND sent = 0 AND content LIKE ?",
-                    (phone, f"%{hint}%"),
-                )
-                conn.commit()
-                reply = f"🗑️ Encontré {len(matches)} recordatorios relacionados con \"{hint}\" y los borré todos."
+                placeholders = ",".join("?" * len(ids))
+                matches = conn.execute(
+                    f"SELECT id, content, due_at FROM reminders WHERE phone = ? AND sent = 0 AND id IN ({placeholders})",
+                    (phone, *ids),
+                ).fetchall()
+                if not matches:
+                    reply = "No encontré ese recordatorio (puede que ya se haya borrado)."
+                else:
+                    conn.execute(
+                        f"DELETE FROM reminders WHERE phone = ? AND id IN ({placeholders})",
+                        (phone, *ids),
+                    )
+                    conn.commit()
+                    if len(matches) == 1:
+                        d = datetime.fromisoformat(matches[0]["due_at"])
+                        reply = f"🗑️ Borré: \"{matches[0]['content']}\" — {d.strftime('%d/%m %H:%M')}"
+                    else:
+                        reply = f"🗑️ Borré {len(matches)} recordatorios: " + ", ".join(f'"{m["content"]}"' for m in matches)
 
         elif result["type"] == "edit_reminder":
-            hint = (result.get("target_hint") or "").strip()
+            ids = [i for i in (result.get("target_ids") or []) if isinstance(i, int)]
             new_due_at = result.get("new_due_at")
-            matches = conn.execute(
-                "SELECT id, content, due_at FROM reminders WHERE phone = ? AND sent = 0 AND content LIKE ? ORDER BY due_at ASC",
-                (phone, f"%{hint}%"),
-            ).fetchall() if hint else []
 
             if not new_due_at:
                 reply = "No entendí bien a qué hora querés moverlo. ¿Podés decirlo de nuevo con la fecha/hora exacta?"
-            elif not matches:
-                reply = f"No encontré ningún recordatorio pendiente relacionado con \"{hint}\"."
-            elif len(matches) > 1:
-                reply = f"Encontré {len(matches)} recordatorios relacionados con \"{hint}\" — decime cuál más específicamente."
+            elif not ids:
+                reply = "No identifiqué a cuál recordatorio te referís. Decime \"¿qué recordatorios tengo?\" para ver la lista completa."
+            elif len(ids) > 1:
+                reply = "Encontré más de un recordatorio que podría coincidir — decime cuál más específicamente."
             else:
-                conn.execute("UPDATE reminders SET due_at = ? WHERE id = ?", (new_due_at, matches[0]["id"]))
-                conn.commit()
-                d = datetime.fromisoformat(new_due_at)
-                reply = f"✅ Listo, moví \"{matches[0]['content']}\" para el {d.strftime('%d/%m/%Y %H:%M')}"
+                match = conn.execute(
+                    "SELECT content FROM reminders WHERE phone = ? AND sent = 0 AND id = ?",
+                    (phone, ids[0]),
+                ).fetchone()
+                if not match:
+                    reply = "No encontré ese recordatorio (puede que ya se haya borrado)."
+                else:
+                    conn.execute("UPDATE reminders SET due_at = ? WHERE id = ?", (new_due_at, ids[0]))
+                    conn.commit()
+                    d = datetime.fromisoformat(new_due_at)
+                    reply = f"✅ Listo, moví \"{match['content']}\" para el {d.strftime('%d/%m/%Y %H:%M')}"
 
         elif result["type"] == "postpone":
             last = conn.execute(
@@ -490,25 +525,27 @@ def process_and_reply(phone: str, incoming_msg: str, media_url: str = None, medi
                 reply = f"⏳ Listo, te lo vuelvo a recordar en {minutes} minutos: \"{last['content']}\""
 
         elif result["type"] == "complete_reminder":
-            hint = (result.get("target_hint") or "").strip()
-            matches = conn.execute(
-                "SELECT id, content FROM reminders WHERE phone = ? AND sent = 0 AND content LIKE ? ORDER BY due_at ASC",
-                (phone, f"%{hint}%"),
-            ).fetchall() if hint else []
-
-            if not matches:
-                reply = f"No encontré ningún recordatorio pendiente relacionado con \"{hint}\"."
-            elif len(matches) == 1:
-                conn.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (matches[0]["id"],))
-                conn.commit()
-                reply = f"✅ ¡Buenísimo! Marqué como hecho: \"{matches[0]['content']}\""
+            ids = [i for i in (result.get("target_ids") or []) if isinstance(i, int)]
+            if not ids:
+                reply = "No identifiqué a cuál recordatorio te referís. Decime \"¿qué recordatorios tengo?\" para ver la lista completa."
             else:
-                conn.execute(
-                    "UPDATE reminders SET sent = 1 WHERE phone = ? AND sent = 0 AND content LIKE ?",
-                    (phone, f"%{hint}%"),
-                )
-                conn.commit()
-                reply = f"✅ Marqué como hechos los {len(matches)} recordatorios relacionados con \"{hint}\"."
+                placeholders = ",".join("?" * len(ids))
+                matches = conn.execute(
+                    f"SELECT id, content FROM reminders WHERE phone = ? AND sent = 0 AND id IN ({placeholders})",
+                    (phone, *ids),
+                ).fetchall()
+                if not matches:
+                    reply = "No encontré ese recordatorio (puede que ya esté marcado como hecho)."
+                else:
+                    conn.execute(
+                        f"UPDATE reminders SET sent = 1 WHERE phone = ? AND id IN ({placeholders})",
+                        (phone, *ids),
+                    )
+                    conn.commit()
+                    if len(matches) == 1:
+                        reply = f"✅ ¡Buenísimo! Marqué como hecho: \"{matches[0]['content']}\""
+                    else:
+                        reply = f"✅ Marqué como hechos: " + ", ".join(f'"{m["content"]}"' for m in matches)
 
         else:  # question
             try:
