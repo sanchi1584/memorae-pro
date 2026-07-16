@@ -7,9 +7,10 @@ Recibe mensajes de WhatsApp (via Twilio), usa Gemini para entender la intención
 
 import os
 import json
-import sqlite3
 import time
+import base64
 import threading
+import sqlite3
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -32,6 +33,7 @@ TWILIO_WHATSAPP_NUMBER = os.environ["TWILIO_WHATSAPP_NUMBER"]  # ej: whatsapp:+1
 APP_TIMEZONE = os.environ.get("APP_TIMEZONE", "America/Mexico_City")
 DB_PATH = os.environ.get("DB_PATH", "memorae.db")
 GEMINI_MODEL = "gemini-flash-lite-latest"
+DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR", "8"))
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -40,7 +42,7 @@ tz = ZoneInfo(APP_TIMEZONE)
 app = Flask(__name__)
 
 # --------------------------------------------------------------------------
-# Base de datos
+# Base de datos (SQLite)
 # --------------------------------------------------------------------------
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -50,7 +52,7 @@ def get_db():
 
 def init_db():
     conn = get_db()
-    conn.executescript(
+    conn.execute(
         """
         CREATE TABLE IF NOT EXISTS reminders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,22 +61,38 @@ def init_db():
             due_at TEXT NOT NULL,
             sent INTEGER DEFAULT 0,
             created_at TEXT NOT NULL
-        );
-
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS notes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             phone TEXT NOT NULL,
             content TEXT NOT NULL,
             created_at TEXT NOT NULL
-        );
-
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS conversation_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             phone TEXT NOT NULL,
             role TEXT NOT NULL,
             content TEXT NOT NULL,
             created_at TEXT NOT NULL
-        );
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS last_fired (
+            phone TEXT PRIMARY KEY,
+            content TEXT NOT NULL,
+            due_at TEXT NOT NULL,
+            fired_at TEXT NOT NULL
+        )
         """
     )
     conn.commit()
@@ -90,12 +108,13 @@ La fecha y hora actual es {{now}} (zona horaria {APP_TIMEZONE}).
 Dado un mensaje del usuario, responde SOLO con un JSON (sin texto adicional, sin markdown) con esta forma exacta:
 
 {{{{
-  "type": "reminder" | "note" | "list_reminders" | "list_notes" | "delete_reminders" | "delete_notes" | "delete_specific_reminder" | "edit_reminder" | "question",
+  "type": "reminder" | "note" | "list_reminders" | "list_notes" | "delete_reminders" | "delete_notes" | "delete_specific_reminder" | "edit_reminder" | "postpone" | "question",
   "content": "texto limpio del recordatorio o nota (null si no aplica)",
   "due_at": "fecha y hora en formato ISO 8601 con zona horaria del PRIMER (o único) aviso, o null si no aplica",
   "occurrences": ["fecha y hora ISO 8601 de cada aviso adicional"] o null si es un recordatorio de una sola vez,
   "target_hint": "para delete_specific_reminder o edit_reminder: unas pocas palabras clave del recordatorio al que se refiere el usuario (ej. 'correr', 'llamar al doctor'), o null si no aplica",
   "new_due_at": "para edit_reminder: la nueva fecha/hora en ISO 8601, o null si no aplica",
+  "postpone_minutes": "para postpone: cuántos minutos posponer (número entero; si dice 'un rato' sin especificar, usa 10), o null si no aplica",
   "fact_to_remember": "un dato personal duradero sobre el usuario mencionado en el mensaje (nombre, gustos, trabajo, relaciones, preferencias, etc.), en pocas palabras y en tercera persona, o null si no hay ningún dato nuevo que valga la pena recordar"
 }}}}
 
@@ -110,6 +129,8 @@ Reglas:
   "cancela el aviso de llamar al doctor"). Pon en "target_hint" las palabras clave para identificarlo.
 - "edit_reminder": el usuario pide cambiar la hora/fecha de un recordatorio existente (ej. "cambia el de correr para las 9am",
   "mueve el recordatorio del informe al viernes"). Pon en "target_hint" las palabras clave, y en "new_due_at" la nueva fecha/hora.
+- "postpone": el usuario pide posponer/aplazar/dejar para más tarde el recordatorio que acaba de sonar (ej. "posponer 10 min",
+  "avisame en 15 minutos mejor", "dale, en un rato"). Pon el número de minutos en "postpone_minutes".
 - "question": cualquier otra cosa, incluyendo preguntas generales tipo chat (incluye buscar en notas, ej. "¿qué anoté sobre el auto?").
 - Si el usuario da una hora relativa ("en 2 horas", "mañana", "el viernes"), calcula la fecha absoluta usando la fecha/hora actual dada arriba.
 - Si es "reminder" pero no dio ninguna indicación de tiempo, trátalo como "note" en vez de "reminder".
@@ -195,6 +216,38 @@ def call_gemini(system_instruction: str, contents: list, max_retries: int = 3) -
         return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
+def describe_media(media_url: str, content_type: str) -> str:
+    """Descarga un archivo multimedia de WhatsApp (via Twilio) y usa Gemini
+    para transcribirlo (audio) o describir su contenido relevante (foto),
+    devolviendo texto que se procesa igual que si el usuario lo hubiera escrito."""
+    resp = requests.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=20)
+    resp.raise_for_status()
+    b64_data = base64.b64encode(resp.content).decode("utf-8")
+
+    if content_type.startswith("audio"):
+        prompt = (
+            "Transcribe este audio de WhatsApp literalmente, en el idioma en que está hablado. "
+            "Responde SOLO con la transcripción, sin comentarios adicionales."
+        )
+    elif content_type.startswith("image"):
+        prompt = (
+            "Describí brevemente el contenido relevante de esta imagen (texto visible, objetos "
+            "importantes, contexto) para que un asistente personal lo use como si el usuario lo "
+            "hubiera escrito. Responde SOLO con la descripción/texto extraído, sin comentarios adicionales."
+        )
+    else:
+        raise ValueError(f"Tipo de archivo no soportado: {content_type}")
+
+    contents = [{
+        "role": "user",
+        "parts": [
+            {"text": prompt},
+            {"inline_data": {"mime_type": content_type, "data": b64_data}},
+        ],
+    }]
+    return call_gemini("Eres un transcriptor/descriptor preciso y conciso.", contents).strip()
+
+
 def classify_message(user_message: str) -> dict:
     now_str = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %Z")
     system = CLASSIFIER_SYSTEM_PROMPT.format(now=now_str)
@@ -251,10 +304,20 @@ def answer_general_question(phone: str, user_message: str) -> str:
 # --------------------------------------------------------------------------
 # Webhook de Twilio
 # --------------------------------------------------------------------------
-def process_and_reply(phone: str, incoming_msg: str):
+def process_and_reply(phone: str, incoming_msg: str, media_url: str = None, media_content_type: str = None):
     """Hace todo el trabajo pesado (clasificar con Gemini, guardar en BD) y
     manda la respuesta real por WhatsApp usando la API de Twilio directamente
     (no TwiML), para no depender del límite de tiempo del webhook."""
+    if media_url and media_content_type:
+        try:
+            media_text = describe_media(media_url, media_content_type)
+        except Exception as e:
+            print(f"Error procesando archivo multimedia: {e}")
+            send_whatsapp(phone, "⚠️ No pude procesar el audio/foto que mandaste. ¿Podés intentar de nuevo o escribirlo en texto?")
+            return
+        # Si además vino texto junto con el archivo (caption), lo combinamos
+        incoming_msg = f"{incoming_msg}\n{media_text}".strip() if incoming_msg else media_text
+
     try:
         result = classify_message(incoming_msg)
     except Exception as e:
@@ -406,6 +469,22 @@ def process_and_reply(phone: str, incoming_msg: str):
                 d = datetime.fromisoformat(new_due_at)
                 reply = f"✅ Listo, moví \"{matches[0]['content']}\" para el {d.strftime('%d/%m/%Y %H:%M')}"
 
+        elif result["type"] == "postpone":
+            last = conn.execute(
+                "SELECT content FROM last_fired WHERE phone = ?", (phone,)
+            ).fetchone()
+            minutes = result.get("postpone_minutes") or 10
+            if not last:
+                reply = "No tengo ningún recordatorio reciente para posponer. ¿Cuál querés que te vuelva a avisar?"
+            else:
+                new_due = datetime.now(tz) + timedelta(minutes=minutes)
+                conn.execute(
+                    "INSERT INTO reminders (phone, content, due_at, created_at) VALUES (?, ?, ?, ?)",
+                    (phone, last["content"], new_due.isoformat(), now_iso),
+                )
+                conn.commit()
+                reply = f"⏳ Listo, te lo vuelvo a recordar en {minutes} minutos: \"{last['content']}\""
+
         else:  # question
             try:
                 reply = answer_general_question(phone, incoming_msg)
@@ -437,17 +516,24 @@ def send_whatsapp(phone: str, body: str):
 def webhook():
     incoming_msg = request.values.get("Body", "").strip()
     phone = request.values.get("From", "")  # ej: whatsapp:+52155...
+    num_media = int(request.values.get("NumMedia", "0") or "0")
+    media_url = request.values.get("MediaUrl0") if num_media > 0 else None
+    media_content_type = request.values.get("MediaContentType0") if num_media > 0 else None
 
     # Respondemos a Twilio al instante (sin esperar a Gemini), para no
     # depender de su límite de tiempo. El mensaje real se manda aparte,
     # en un hilo en segundo plano, usando la API de Twilio directamente.
     resp = MessagingResponse()
 
-    if not incoming_msg:
-        resp.message("No recibí ningún texto. ¿Puedes intentar de nuevo?")
+    if not incoming_msg and not media_url:
+        resp.message("No recibí ningún texto ni archivo. ¿Puedes intentar de nuevo?")
         return Response(str(resp), mimetype="application/xml")
 
-    threading.Thread(target=process_and_reply, args=(phone, incoming_msg), daemon=True).start()
+    threading.Thread(
+        target=process_and_reply,
+        args=(phone, incoming_msg, media_url, media_content_type),
+        daemon=True,
+    ).start()
     return Response(str(resp), mimetype="application/xml")
 
 
@@ -458,7 +544,7 @@ def check_due_reminders():
     conn = get_db()
     now_iso = datetime.now(tz).isoformat()
     rows = conn.execute(
-        "SELECT id, phone, content FROM reminders WHERE sent = 0 AND due_at <= ?",
+        "SELECT id, phone, content, due_at FROM reminders WHERE sent = 0 AND due_at <= ?",
         (now_iso,),
     ).fetchall()
 
@@ -467,18 +553,50 @@ def check_due_reminders():
             twilio_client.messages.create(
                 from_=TWILIO_WHATSAPP_NUMBER,
                 to=r["phone"],
-                body=f"⏰ Recordatorio: {r['content']}",
+                body=f"⏰ Recordatorio: {r['content']}\n(si querés, respondé \"posponer 10 min\")",
             )
             conn.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (r["id"],))
+            conn.execute("DELETE FROM last_fired WHERE phone = ?", (r["phone"],))
+            conn.execute(
+                "INSERT INTO last_fired (phone, content, due_at, fired_at) VALUES (?, ?, ?, ?)",
+                (r["phone"], r["content"], r["due_at"], now_iso),
+            )
+            conn.commit()
         except Exception as e:
             print(f"Error enviando recordatorio {r['id']}: {e}")
 
-    conn.commit()
+    conn.close()
+
+
+def send_daily_summaries():
+    """Cada mañana (a la hora configurada), le manda a cada usuario con
+    recordatorios pendientes para hoy un resumen único con todo lo que tiene."""
+    conn = get_db()
+    today_str = datetime.now(tz).strftime("%Y-%m-%d")
+    phones = conn.execute(
+        "SELECT DISTINCT phone FROM reminders WHERE sent = 0"
+    ).fetchall()
+
+    for row in phones:
+        phone = row["phone"]
+        todays = conn.execute(
+            "SELECT content, due_at FROM reminders WHERE phone = ? AND sent = 0 AND due_at LIKE ? ORDER BY due_at ASC",
+            (phone, f"{today_str}%"),
+        ).fetchall()
+        if not todays:
+            continue
+        lines = ["☀️ ¡Buenos días! Esto es lo que tenés para hoy:"]
+        for r in todays:
+            d = datetime.fromisoformat(r["due_at"])
+            lines.append(f"• {r['content']} — {d.strftime('%H:%M')}")
+        send_whatsapp(phone, "\n".join(lines))
+
     conn.close()
 
 
 scheduler = BackgroundScheduler(timezone=str(tz))
 scheduler.add_job(check_due_reminders, "interval", minutes=1)
+scheduler.add_job(send_daily_summaries, "cron", hour=DAILY_SUMMARY_HOUR, minute=0)
 scheduler.start()
 
 
