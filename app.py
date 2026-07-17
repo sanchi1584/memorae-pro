@@ -1,8 +1,13 @@
 """
 Memorae Clone - Asistente de memoria personal por WhatsApp
 =============================================================
-Recibe mensajes de WhatsApp (via Twilio), usa Gemini para entender la intención
+Recibe mensajes de WhatsApp (via Twilio o via la API de Meta/Cloud API,
+según WHATSAPP_PROVIDER), usa Gemini para entender la intención
 (recordatorio, nota, o pregunta general) y responde / guarda / programa avisos.
+
+Rutas de webhook:
+- /webhook       -> Twilio (form-encoded)
+- /webhook-meta  -> Meta / WhatsApp Cloud API (JSON), con verificación GET
 """
 
 import os
@@ -27,9 +32,23 @@ load_dotenv()
 # Configuración
 # --------------------------------------------------------------------------
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
-TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
-TWILIO_WHATSAPP_NUMBER = os.environ["TWILIO_WHATSAPP_NUMBER"]  # ej: whatsapp:+14155238886
+
+# Proveedor de WhatsApp activo: "twilio" o "meta". Se cambia con una variable
+# de entorno en Render, sin tocar código, para poder volver atrás si algo falla.
+WHATSAPP_PROVIDER = os.environ.get("WHATSAPP_PROVIDER", "twilio").strip().lower()
+
+# --- Twilio (opcional si WHATSAPP_PROVIDER == "meta") ---
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
+TWILIO_WHATSAPP_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER", "")  # ej: whatsapp:+14155238886
+
+# --- Meta / WhatsApp Cloud API (opcional si WHATSAPP_PROVIDER == "twilio") ---
+META_PHONE_NUMBER_ID = os.environ.get("META_PHONE_NUMBER_ID", "")
+META_ACCESS_TOKEN = os.environ.get("META_ACCESS_TOKEN", "")
+META_VERIFY_TOKEN = os.environ.get("META_VERIFY_TOKEN", "memorae_verify")
+META_API_VERSION = os.environ.get("META_API_VERSION", "v20.0")
+META_MESSAGES_URL = f"https://graph.facebook.com/{META_API_VERSION}/{META_PHONE_NUMBER_ID}/messages"
+
 APP_TIMEZONE = os.environ.get("APP_TIMEZONE", "America/Mexico_City")
 DB_PATH = os.environ.get("DB_PATH", "memorae.db")
 GEMINI_MODEL = "gemini-flash-lite-latest"
@@ -39,7 +58,7 @@ WEATHER_LAT = os.environ.get("WEATHER_LAT", "-26.7825")
 WEATHER_LON = os.environ.get("WEATHER_LON", "-55.0339")
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
-twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN else None
 tz = ZoneInfo(APP_TIMEZONE)
 
 app = Flask(__name__)
@@ -230,11 +249,30 @@ def call_gemini(system_instruction: str, contents: list, max_retries: int = 3) -
         return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
+def get_meta_media_url(media_id: str) -> str | None:
+    """Meta no manda la URL del archivo directamente en el webhook, solo un
+    media_id. Hay que pedirle a la Graph API la URL real (válida ~5 minutos)."""
+    try:
+        resp = requests.get(
+            f"https://graph.facebook.com/{META_API_VERSION}/{media_id}",
+            headers={"Authorization": f"Bearer {META_ACCESS_TOKEN}"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json().get("url")
+    except Exception as e:
+        print(f"Error obteniendo URL de media de Meta ({media_id}): {e}")
+        return None
+
+
 def describe_media(media_url: str, content_type: str) -> str:
     """Descarga un archivo multimedia de WhatsApp (via Twilio) y usa Gemini
     para transcribirlo (audio) o describir su contenido relevante (foto),
     devolviendo texto que se procesa igual que si el usuario lo hubiera escrito."""
-    resp = requests.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=20)
+    if WHATSAPP_PROVIDER == "meta":
+        resp = requests.get(media_url, headers={"Authorization": f"Bearer {META_ACCESS_TOKEN}"}, timeout=20)
+    else:
+        resp = requests.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=20)
     resp.raise_for_status()
     b64_data = base64.b64encode(resp.content).decode("utf-8")
 
@@ -560,7 +598,19 @@ def process_and_reply(phone: str, incoming_msg: str, media_url: str = None, medi
 
 
 def send_whatsapp(phone: str, body: str):
+    """Manda un mensaje de WhatsApp usando el proveedor configurado
+    (WHATSAPP_PROVIDER: "twilio" o "meta")."""
+    if WHATSAPP_PROVIDER == "meta":
+        send_whatsapp_meta(phone, body)
+    else:
+        send_whatsapp_twilio(phone, body)
+
+
+def send_whatsapp_twilio(phone: str, body: str):
     """Manda un mensaje de WhatsApp usando la API de Twilio (no TwiML)."""
+    if not twilio_client:
+        print("Twilio no está configurado (faltan TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN).")
+        return
     try:
         twilio_client.messages.create(
             from_=TWILIO_WHATSAPP_NUMBER,
@@ -568,7 +618,34 @@ def send_whatsapp(phone: str, body: str):
             body=body,
         )
     except Exception as e:
-        print(f"Error mandando mensaje de WhatsApp a {phone}: {e}")
+        print(f"Error mandando mensaje de WhatsApp (Twilio) a {phone}: {e}")
+
+
+def send_whatsapp_meta(phone: str, body: str):
+    """Manda un mensaje de texto libre usando la API de Meta (WhatsApp Cloud API).
+    OJO: los mensajes de texto libre solo se entregan si el usuario escribió
+    en las últimas 24hs (ventana de conversación). Fuera de esa ventana, Meta
+    requiere un mensaje de plantilla (template) pre-aprobado."""
+    to_number = phone.replace("whatsapp:", "").lstrip("+")
+    try:
+        resp = requests.post(
+            META_MESSAGES_URL,
+            headers={
+                "Authorization": f"Bearer {META_ACCESS_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "messaging_product": "whatsapp",
+                "to": to_number,
+                "type": "text",
+                "text": {"body": body},
+            },
+            timeout=15,
+        )
+        if resp.status_code >= 400:
+            print(f"Error mandando mensaje de WhatsApp (Meta) a {phone}: {resp.status_code} {resp.text}")
+    except Exception as e:
+        print(f"Error mandando mensaje de WhatsApp (Meta) a {phone}: {e}")
 
 
 @app.route("/webhook", methods=["POST"])
@@ -596,6 +673,66 @@ def webhook():
     return Response(str(resp), mimetype="application/xml")
 
 
+@app.route("/webhook-meta", methods=["GET"])
+def webhook_meta_verify():
+    """Meta llama a esta ruta UNA vez, al configurar el webhook en el panel,
+    para confirmar que el servidor es tuyo."""
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge", "")
+    if mode == "subscribe" and token == META_VERIFY_TOKEN:
+        return Response(challenge, mimetype="text/plain")
+    return "Verificación fallida: token incorrecto.", 403
+
+
+@app.route("/webhook-meta", methods=["POST"])
+def webhook_meta():
+    """Recibe mensajes entrantes de la API de Meta (formato JSON, distinto
+    al form-encoded de Twilio). Meta espera un 200 rápido, así que el
+    trabajo pesado va en un hilo aparte, igual que con Twilio."""
+    data = request.get_json(silent=True) or {}
+    try:
+        change = data["entry"][0]["changes"][0]["value"]
+        messages = change.get("messages")
+        if not messages:
+            # Puede ser una notificación de status (entregado/leído), no un mensaje nuevo
+            return Response(status=200)
+
+        msg = messages[0]
+        phone = "+" + msg["from"]  # Meta manda el número sin "+"
+        msg_type = msg.get("type")
+
+        incoming_msg = ""
+        media_url = None
+        media_content_type = None
+
+        if msg_type == "text":
+            incoming_msg = msg["text"]["body"].strip()
+        elif msg_type in ("audio", "image"):
+            media_id = msg[msg_type]["id"]
+            media_content_type = msg[msg_type].get("mime_type", "")
+            media_url = get_meta_media_url(media_id)
+            if not media_url:
+                send_whatsapp(phone, "⚠️ No pude descargar el audio/foto que mandaste. ¿Podés intentar de nuevo?")
+                return Response(status=200)
+
+        if not incoming_msg and not media_url:
+            send_whatsapp(phone, "No recibí ningún texto ni archivo que pueda procesar. ¿Puedes intentar de nuevo?")
+            return Response(status=200)
+
+        threading.Thread(
+            target=process_and_reply,
+            args=(phone, incoming_msg, media_url, media_content_type),
+            daemon=True,
+        ).start()
+    except (KeyError, IndexError):
+        pass  # Eventos de Meta que no son mensajes (ej. cambios de estado de la cuenta)
+    except Exception as e:
+        print(f"Error procesando webhook de Meta: {e}")
+
+    return Response(status=200)
+
+
 # --------------------------------------------------------------------------
 # Envío proactivo de recordatorios vencidos
 # --------------------------------------------------------------------------
@@ -609,10 +746,9 @@ def check_due_reminders():
 
     for r in rows:
         try:
-            twilio_client.messages.create(
-                from_=TWILIO_WHATSAPP_NUMBER,
-                to=r["phone"],
-                body=f"⏰ Recordatorio: {r['content']}\n(si querés, respondé \"posponer 10 min\")",
+            send_whatsapp(
+                r["phone"],
+                f"⏰ Recordatorio: {r['content']}\n(si querés, respondé \"posponer 10 min\")",
             )
             conn.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (r["id"],))
             conn.execute("DELETE FROM last_fired WHERE phone = ?", (r["phone"],))
