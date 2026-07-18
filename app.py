@@ -366,6 +366,7 @@ def process_and_reply(phone: str, incoming_msg: str, media_url: str = None, medi
     """Hace todo el trabajo pesado (clasificar con Gemini, guardar en BD) y
     manda la respuesta real por WhatsApp usando la API de Twilio directamente
     (no TwiML), para no depender del límite de tiempo del webhook."""
+    print(f"[process_and_reply] INICIO — phone={phone!r} msg={incoming_msg!r} media_url={bool(media_url)}")
     if media_url and media_content_type:
         try:
             media_text = describe_media(media_url, media_content_type)
@@ -594,7 +595,9 @@ def process_and_reply(phone: str, incoming_msg: str, media_url: str = None, medi
     finally:
         conn.close()
 
+    print(f"[process_and_reply] Enviando respuesta a {phone!r}: {reply!r}")
     send_whatsapp(phone, reply)
+    print(f"[process_and_reply] FIN — send_whatsapp llamado para {phone!r}")
 
 
 def send_whatsapp(phone: str, body: str):
@@ -644,6 +647,8 @@ def send_whatsapp_meta(phone: str, body: str):
         )
         if resp.status_code >= 400:
             print(f"Error mandando mensaje de WhatsApp (Meta) a {phone}: {resp.status_code} {resp.text}")
+        else:
+            print(f"[send_whatsapp_meta] OK — enviado a {phone} (to_number={to_number}): {resp.status_code} {resp.text}")
     except Exception as e:
         print(f"Error mandando mensaje de WhatsApp (Meta) a {phone}: {e}")
 
@@ -691,16 +696,18 @@ def webhook_meta():
     al form-encoded de Twilio). Meta espera un 200 rápido, así que el
     trabajo pesado va en un hilo aparte, igual que con Twilio."""
     data = request.get_json(silent=True) or {}
+    print(f"[webhook_meta] Payload recibido: {json.dumps(data)[:2000]}")
     try:
         change = data["entry"][0]["changes"][0]["value"]
         messages = change.get("messages")
         if not messages:
-            # Puede ser una notificación de status (entregado/leído), no un mensaje nuevo
+            print("[webhook_meta] Sin 'messages' en el payload (probablemente evento de status), se ignora.")
             return Response(status=200)
 
         msg = messages[0]
         phone = "+" + msg["from"]  # Meta manda el número sin "+"
         msg_type = msg.get("type")
+        print(f"[webhook_meta] Mensaje de {phone}, tipo={msg_type}")
 
         incoming_msg = ""
         media_url = None
@@ -720,13 +727,14 @@ def webhook_meta():
             send_whatsapp(phone, "No recibí ningún texto ni archivo que pueda procesar. ¿Puedes intentar de nuevo?")
             return Response(status=200)
 
+        print(f"[webhook_meta] Arrancando hilo de process_and_reply para {phone}")
         threading.Thread(
             target=process_and_reply,
             args=(phone, incoming_msg, media_url, media_content_type),
             daemon=True,
         ).start()
-    except (KeyError, IndexError):
-        pass  # Eventos de Meta que no son mensajes (ej. cambios de estado de la cuenta)
+    except (KeyError, IndexError) as e:
+        print(f"[webhook_meta] Payload sin 'messages' esperado (evento ignorado): {e}")
     except Exception as e:
         print(f"Error procesando webhook de Meta: {e}")
 
