@@ -783,26 +783,32 @@ WEATHER_CODE_DESCRIPTIONS = {
 
 
 def get_weather_summary() -> str | None:
-    """Consulta el clima actual con Open-Meteo (gratis, sin API key)."""
-    try:
-        resp = requests.get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": WEATHER_LAT,
-                "longitude": WEATHER_LON,
-                "current": "temperature_2m,weather_code",
-                "timezone": "auto",
-            },
-            timeout=10,
-        )
-        resp.raise_for_status()
-        current = resp.json()["current"]
-        temp = round(current["temperature_2m"])
-        emoji, desc = WEATHER_CODE_DESCRIPTIONS.get(current["weather_code"], ("🌡️", "condiciones variables"))
-        return f"{emoji} {temp}°C, {desc}"
-    except Exception as e:
-        print(f"Error consultando el clima: {e}")
-        return None
+    """Consulta el clima actual con Open-Meteo (gratis, sin API key).
+    Reintenta una vez si la primera consulta falla (por ej. un 429 pasajero,
+    común en el plan gratuito de Render por IPs compartidas con otras apps)."""
+    for intento in range(2):
+        try:
+            resp = requests.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": WEATHER_LAT,
+                    "longitude": WEATHER_LON,
+                    "current": "temperature_2m,weather_code",
+                    "timezone": "auto",
+                },
+                headers={"User-Agent": "memorae-pro/1.0 (+https://memorae-pro.onrender.com)"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            current = resp.json()["current"]
+            temp = round(current["temperature_2m"])
+            emoji, desc = WEATHER_CODE_DESCRIPTIONS.get(current["weather_code"], ("🌡️", "condiciones variables"))
+            return f"{emoji} {temp}°C, {desc}"
+        except Exception as e:
+            print(f"Error consultando el clima (intento {intento + 1}/2): {e}")
+            if intento == 0:
+                time.sleep(2)
+    return None
 
 
 def send_daily_summaries():
