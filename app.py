@@ -244,6 +244,8 @@ def call_gemini(system_instruction: str, contents: list, max_retries: int = 3) -
             print(f"Gemini devolvió 503 (saturado), esperando {wait}s antes de reintentar (intento {attempt + 1}/{max_retries + 1})...")
             time.sleep(wait)
             continue
+        if resp.status_code >= 400:
+            print(f"Gemini devolvió {resp.status_code}: {resp.text[:1000]}")
         resp.raise_for_status()
         data = resp.json()
         return data["candidates"][0]["content"]["parts"][0]["text"]
