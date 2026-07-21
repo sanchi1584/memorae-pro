@@ -51,7 +51,7 @@ META_MESSAGES_URL = f"https://graph.facebook.com/{META_API_VERSION}/{META_PHONE_
 
 APP_TIMEZONE = os.environ.get("APP_TIMEZONE", "America/Mexico_City")
 DB_PATH = os.environ.get("DB_PATH", "memorae.db")
-GEMINI_MODEL = "gemini-flash-lite-latest"
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR", "6"))
 DAILY_SUMMARY_MINUTE = int(os.environ.get("DAILY_SUMMARY_MINUTE", "30"))
 WEATHER_LAT = os.environ.get("WEATHER_LAT", "-26.7825")
@@ -210,7 +210,7 @@ def call_gemini(system_instruction: str, contents: list, max_retries: int = 3) -
         "system_instruction": {"parts": [{"text": system_instruction}]},
         "contents": contents,
         "generationConfig": {
-            "thinkingConfig": {"thinkingBudget": 0},
+            "thinkingConfig": {"thinkingLevel": "minimal"},
             "maxOutputTokens": 500,
         },
     }
