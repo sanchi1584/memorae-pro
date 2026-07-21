@@ -396,4 +396,592 @@ def process_and_reply(phone: str, incoming_msg: str, media_url: str = None, medi
         return
 
     # Protección: si el modelo dijo "reminder" o "note" pero no vino contenido
- 
+    # (puede pasar de vez en cuando), lo tratamos como pregunta general en vez
+    # de fallar al intentar guardar una nota/recordatorio vacío.
+    if result.get("type") in ("reminder", "note") and not (result.get("content") or "").strip():
+        print(f"Advertencia: '{result.get('type')}' sin contenido, tratando como pregunta general.")
+        result["type"] = "question"
+
+    conn = get_db()
+    now_iso = datetime.now(tz).isoformat()
+
+    try:
+        # Si el clasificador detectó un dato personal duradero (aunque el mensaje
+        # sea una pregunta o comentario casual), lo guardamos como nota aparte,
+        # sin duplicar el "content" si ya se guardó como nota explícita.
+        fact = result.get("fact_to_remember")
+        if fact and not (result["type"] == "note" and fact.strip() == (result.get("content") or "").strip()):
+            conn.execute(
+                "INSERT INTO notes (phone, content, created_at) VALUES (?, ?, ?)",
+                (phone, fact, now_iso),
+            )
+            conn.commit()
+
+        if result["type"] == "reminder" and result.get("due_at"):
+            all_dates = [result["due_at"]] + [d for d in (result.get("occurrences") or []) if d]
+            # Quitamos fechas duplicadas (por si el modelo repitió alguna)
+            seen = set()
+            unique_dates = []
+            for d in all_dates:
+                if d not in seen:
+                    seen.add(d)
+                    unique_dates.append(d)
+
+            # Ordenamos cronológicamente y descartamos cualquier fecha que ya haya
+            # pasado (ej. si el usuario pide "todos los días de 8am a 10pm" pero ya
+            # son las 9pm, los horarios de hoy anteriores a las 9pm no tienen sentido:
+            # sin este filtro, el scheduler los toma como "vencidos" y los dispara
+            # todos de golpe apenas se crean, y el recordatorio desaparece al instante
+            # de la lista de pendientes sin que el usuario llegue a verlo venir).
+            now_dt = datetime.now(tz)
+            future_dates = []
+            for d in unique_dates:
+                try:
+                    d_dt = datetime.fromisoformat(d)
+                    if d_dt.tzinfo is None:
+                        d_dt = d_dt.replace(tzinfo=tz)
+                except ValueError:
+                    continue  # fecha mal formada del modelo, la ignoramos
+                if d_dt > now_dt:
+                    future_dates.append(d)
+            future_dates.sort()
+            all_dates = future_dates[:30]
+
+            if not all_dates:
+                reply = (
+                    "⚠️ Las fechas/horarios que entendí ya pasaron para hoy. "
+                    "¿Podés confirmarme desde cuándo querés que empiece (por ejemplo, "
+                    "\"desde mañana a las 8am\")?"
+                )
+            else:
+                inserted = 0
+                for due_at in all_dates:
+                    exists = conn.execute(
+                        "SELECT 1 FROM reminders WHERE phone = ? AND content = ? AND due_at = ? AND sent = 0",
+                        (phone, result["content"], due_at),
+                    ).fetchone()
+                    if not exists:
+                        conn.execute(
+                            "INSERT INTO reminders (phone, content, due_at, created_at) VALUES (?, ?, ?, ?)",
+                            (phone, result["content"], due_at, now_iso),
+                        )
+                        inserted += 1
+                conn.commit()
+                first_dt = datetime.fromisoformat(all_dates[0])
+                if len(all_dates) > 1:
+                    last_dt = datetime.fromisoformat(all_dates[-1])
+                    reply = (
+                        f"✅ Listo, te recordaré: \"{result['content']}\"\n"
+                        f"🔁 {len(all_dates)} avisos, desde el {first_dt.strftime('%d/%m/%Y %H:%M')} "
+                        f"hasta el {last_dt.strftime('%d/%m/%Y %H:%M')}"
+                    )
+                else:
+                    reply = f"✅ Listo, te recordaré: \"{result['content']}\"\n🕒 {first_dt.strftime('%d/%m/%Y %H:%M')}"
+
+        elif result["type"] == "note":
+            conn.execute(
+                "INSERT INTO notes (phone, content, created_at) VALUES (?, ?, ?)",
+                (phone, result["content"], now_iso),
+            )
+            conn.commit()
+            reply = f"📝 Anotado: \"{result['content']}\""
+
+        elif result["type"] == "list_reminders":
+            rows = conn.execute(
+                "SELECT content, due_at FROM reminders WHERE phone = ? AND sent = 0 ORDER BY due_at ASC",
+                (phone,),
+            ).fetchall()
+            if not rows:
+                reply = "No tienes recordatorios pendientes."
+            else:
+                lines = ["📌 Tus recordatorios pendientes:"]
+                for r in rows:
+                    d = datetime.fromisoformat(r["due_at"])
+                    lines.append(f"• {r['content']} — {d.strftime('%d/%m %H:%M')}")
+                reply = "\n".join(lines)
+
+        elif result["type"] == "list_notes":
+            rows = conn.execute(
+                "SELECT content, created_at FROM notes WHERE phone = ? ORDER BY id DESC LIMIT 20",
+                (phone,),
+            ).fetchall()
+            if not rows:
+                reply = "Todavía no tienes notas guardadas."
+            else:
+                lines = ["🗒️ Tus notas:"]
+                for r in rows:
+                    lines.append(f"• {r['content']}")
+                reply = "\n".join(lines)
+
+        elif result["type"] == "delete_reminders":
+            cur = conn.execute("DELETE FROM reminders WHERE phone = ?", (phone,))
+            conn.commit()
+            reply = f"🗑️ Listo, borré {cur.rowcount} recordatorio(s)." if cur.rowcount else "No tenías recordatorios para borrar."
+
+        elif result["type"] == "delete_notes":
+            cur = conn.execute("DELETE FROM notes WHERE phone = ?", (phone,))
+            conn.commit()
+            reply = f"🗑️ Listo, borré {cur.rowcount} nota(s)." if cur.rowcount else "No tenías notas para borrar."
+
+        elif result["type"] == "delete_specific_reminder":
+            ids = [i for i in (result.get("target_ids") or []) if isinstance(i, int)]
+            if not ids:
+                reply = "No identifiqué a cuál recordatorio te referís. Decime \"¿qué recordatorios tengo?\" para ver la lista completa."
+            else:
+                placeholders = ",".join("?" * len(ids))
+                matches = conn.execute(
+                    f"SELECT id, content, due_at FROM reminders WHERE phone = ? AND sent = 0 AND id IN ({placeholders})",
+                    (phone, *ids),
+                ).fetchall()
+                if not matches:
+                    reply = "No encontré ese recordatorio (puede que ya se haya borrado)."
+                else:
+                    conn.execute(
+                        f"DELETE FROM reminders WHERE phone = ? AND id IN ({placeholders})",
+                        (phone, *ids),
+                    )
+                    conn.commit()
+                    if len(matches) == 1:
+                        d = datetime.fromisoformat(matches[0]["due_at"])
+                        reply = f"🗑️ Borré: \"{matches[0]['content']}\" — {d.strftime('%d/%m %H:%M')}"
+                    else:
+                        reply = f"🗑️ Borré {len(matches)} recordatorios: " + ", ".join(f'"{m["content"]}"' for m in matches)
+
+        elif result["type"] == "edit_reminder":
+            ids = [i for i in (result.get("target_ids") or []) if isinstance(i, int)]
+            new_due_at = result.get("new_due_at")
+
+            if not new_due_at:
+                reply = "No entendí bien a qué hora querés moverlo. ¿Podés decirlo de nuevo con la fecha/hora exacta?"
+            elif not ids:
+                reply = "No identifiqué a cuál recordatorio te referís. Decime \"¿qué recordatorios tengo?\" para ver la lista completa."
+            elif len(ids) > 1:
+                reply = "Encontré más de un recordatorio que podría coincidir — decime cuál más específicamente."
+            else:
+                match = conn.execute(
+                    "SELECT content FROM reminders WHERE phone = ? AND sent = 0 AND id = ?",
+                    (phone, ids[0]),
+                ).fetchone()
+                if not match:
+                    reply = "No encontré ese recordatorio (puede que ya se haya borrado)."
+                else:
+                    conn.execute("UPDATE reminders SET due_at = ? WHERE id = ?", (new_due_at, ids[0]))
+                    conn.commit()
+                    d = datetime.fromisoformat(new_due_at)
+                    reply = f"✅ Listo, moví \"{match['content']}\" para el {d.strftime('%d/%m/%Y %H:%M')}"
+
+        elif result["type"] == "postpone":
+            last = conn.execute(
+                "SELECT content FROM last_fired WHERE phone = ?", (phone,)
+            ).fetchone()
+            minutes = result.get("postpone_minutes") or 10
+            if not last:
+                reply = "No tengo ningún recordatorio reciente para posponer. ¿Cuál querés que te vuelva a avisar?"
+            else:
+                new_due = datetime.now(tz) + timedelta(minutes=minutes)
+                conn.execute(
+                    "INSERT INTO reminders (phone, content, due_at, created_at) VALUES (?, ?, ?, ?)",
+                    (phone, last["content"], new_due.isoformat(), now_iso),
+                )
+                conn.commit()
+                reply = f"⏳ Listo, te lo vuelvo a recordar en {minutes} minutos: \"{last['content']}\""
+
+        elif result["type"] == "complete_reminder":
+            ids = [i for i in (result.get("target_ids") or []) if isinstance(i, int)]
+            if not ids:
+                reply = "No identifiqué a cuál recordatorio te referís. Decime \"¿qué recordatorios tengo?\" para ver la lista completa."
+            else:
+                placeholders = ",".join("?" * len(ids))
+                matches = conn.execute(
+                    f"SELECT id, content FROM reminders WHERE phone = ? AND sent = 0 AND id IN ({placeholders})",
+                    (phone, *ids),
+                ).fetchall()
+                if not matches:
+                    reply = "No encontré ese recordatorio (puede que ya esté marcado como hecho)."
+                else:
+                    conn.execute(
+                        f"UPDATE reminders SET sent = 1 WHERE phone = ? AND id IN ({placeholders})",
+                        (phone, *ids),
+                    )
+                    conn.commit()
+                    if len(matches) == 1:
+                        reply = f"✅ ¡Buenísimo! Marqué como hecho: \"{matches[0]['content']}\""
+                    else:
+                        reply = f"✅ Marqué como hechos: " + ", ".join(f'"{m["content"]}"' for m in matches)
+
+        else:  # question
+            try:
+                reply = answer_general_question(phone, incoming_msg)
+            except Exception as e:
+                print(f"Error respondiendo pregunta general: {e}")
+                reply = "⚠️ Tuve un problema pensando la respuesta (el servicio de IA no respondió). Intenta de nuevo en un momento."
+    except Exception as e:
+        print(f"Error inesperado procesando el mensaje: {e}")
+        reply = "⚠️ Tuve un problema procesando tu mensaje. Intenta de nuevo en un momento."
+    finally:
+        conn.close()
+
+    print(f"[process_and_reply] Enviando respuesta a {phone!r}: {reply!r}")
+    send_whatsapp(phone, reply)
+    print(f"[process_and_reply] FIN — send_whatsapp llamado para {phone!r}")
+
+
+def send_whatsapp(phone: str, body: str):
+    """Manda un mensaje de WhatsApp usando el proveedor configurado
+    (WHATSAPP_PROVIDER: "twilio" o "meta")."""
+    if WHATSAPP_PROVIDER == "meta":
+        send_whatsapp_meta(phone, body)
+    else:
+        send_whatsapp_twilio(phone, body)
+
+
+def send_whatsapp_twilio(phone: str, body: str):
+    """Manda un mensaje de WhatsApp usando la API de Twilio (no TwiML)."""
+    if not twilio_client:
+        print("Twilio no está configurado (faltan TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN).")
+        return
+    try:
+        twilio_client.messages.create(
+            from_=TWILIO_WHATSAPP_NUMBER,
+            to=phone,
+            body=body,
+        )
+    except Exception as e:
+        print(f"Error mandando mensaje de WhatsApp (Twilio) a {phone}: {e}")
+
+
+def send_whatsapp_meta(phone: str, body: str):
+    """Manda un mensaje de texto libre usando la API de Meta (WhatsApp Cloud API).
+    OJO: los mensajes de texto libre solo se entregan si el usuario escribió
+    en las últimas 24hs (ventana de conversación). Fuera de esa ventana, Meta
+    requiere un mensaje de plantilla (template) pre-aprobado."""
+    to_number = phone.replace("whatsapp:", "").lstrip("+")
+    try:
+        resp = requests.post(
+            META_MESSAGES_URL,
+            headers={
+                "Authorization": f"Bearer {META_ACCESS_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "messaging_product": "whatsapp",
+                "to": to_number,
+                "type": "text",
+                "text": {"body": body},
+            },
+            timeout=15,
+        )
+        if resp.status_code >= 400:
+            print(f"Error mandando mensaje de WhatsApp (Meta) a {phone}: {resp.status_code} {resp.text}")
+        else:
+            print(f"[send_whatsapp_meta] OK — enviado a {phone} (to_number={to_number}): {resp.status_code} {resp.text}")
+    except Exception as e:
+        print(f"Error mandando mensaje de WhatsApp (Meta) a {phone}: {e}")
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    incoming_msg = request.values.get("Body", "").strip()
+    phone = request.values.get("From", "")  # ej: whatsapp:+52155...
+    num_media = int(request.values.get("NumMedia", "0") or "0")
+    media_url = request.values.get("MediaUrl0") if num_media > 0 else None
+    media_content_type = request.values.get("MediaContentType0") if num_media > 0 else None
+
+    # Respondemos a Twilio al instante (sin esperar a Gemini), para no
+    # depender de su límite de tiempo. El mensaje real se manda aparte,
+    # en un hilo en segundo plano, usando la API de Twilio directamente.
+    resp = MessagingResponse()
+
+    if not incoming_msg and not media_url:
+        resp.message("No recibí ningún texto ni archivo. ¿Puedes intentar de nuevo?")
+        return Response(str(resp), mimetype="application/xml")
+
+    threading.Thread(
+        target=process_and_reply,
+        args=(phone, incoming_msg, media_url, media_content_type),
+        daemon=True,
+    ).start()
+    return Response(str(resp), mimetype="application/xml")
+
+
+@app.route("/webhook-meta", methods=["GET"])
+def webhook_meta_verify():
+    """Meta llama a esta ruta UNA vez, al configurar el webhook en el panel,
+    para confirmar que el servidor es tuyo."""
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge", "")
+    if mode == "subscribe" and token == META_VERIFY_TOKEN:
+        return Response(challenge, mimetype="text/plain")
+    return "Verificación fallida: token incorrecto.", 403
+
+
+@app.route("/webhook-meta", methods=["POST"])
+def webhook_meta():
+    """Recibe mensajes entrantes de la API de Meta (formato JSON, distinto
+    al form-encoded de Twilio). Meta espera un 200 rápido, así que el
+    trabajo pesado va en un hilo aparte, igual que con Twilio."""
+    data = request.get_json(silent=True) or {}
+    print(f"[webhook_meta] Payload recibido: {json.dumps(data)[:2000]}")
+    try:
+        change = data["entry"][0]["changes"][0]["value"]
+        messages = change.get("messages")
+        if not messages:
+            print("[webhook_meta] Sin 'messages' en el payload (probablemente evento de status), se ignora.")
+            return Response(status=200)
+
+        msg = messages[0]
+        phone = "+" + msg["from"]  # Meta manda el número sin "+"
+        msg_type = msg.get("type")
+        print(f"[webhook_meta] Mensaje de {phone}, tipo={msg_type}")
+
+        incoming_msg = ""
+        media_url = None
+        media_content_type = None
+
+        if msg_type == "text":
+            incoming_msg = msg["text"]["body"].strip()
+        elif msg_type in ("audio", "image"):
+            media_id = msg[msg_type]["id"]
+            media_content_type = msg[msg_type].get("mime_type", "")
+            media_url = get_meta_media_url(media_id)
+            if not media_url:
+                send_whatsapp(phone, "⚠️ No pude descargar el audio/foto que mandaste. ¿Podés intentar de nuevo?")
+                return Response(status=200)
+
+        if not incoming_msg and not media_url:
+            send_whatsapp(phone, "No recibí ningún texto ni archivo que pueda procesar. ¿Puedes intentar de nuevo?")
+            return Response(status=200)
+
+        print(f"[webhook_meta] Arrancando hilo de process_and_reply para {phone}")
+        threading.Thread(
+            target=process_and_reply,
+            args=(phone, incoming_msg, media_url, media_content_type),
+            daemon=True,
+        ).start()
+    except (KeyError, IndexError) as e:
+        print(f"[webhook_meta] Payload sin 'messages' esperado (evento ignorado): {e}")
+    except Exception as e:
+        print(f"Error procesando webhook de Meta: {e}")
+
+    return Response(status=200)
+
+
+# --------------------------------------------------------------------------
+# Envío proactivo de recordatorios vencidos
+# --------------------------------------------------------------------------
+def check_due_reminders():
+    conn = get_db()
+    now_iso = datetime.now(tz).isoformat()
+    rows = conn.execute(
+        "SELECT id, phone, content, due_at FROM reminders WHERE sent = 0 AND due_at <= ?",
+        (now_iso,),
+    ).fetchall()
+
+    for r in rows:
+        try:
+            send_whatsapp(
+                r["phone"],
+                f"⏰ Recordatorio: {r['content']}\n(si querés, respondé \"posponer 10 min\")",
+            )
+            conn.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (r["id"],))
+            conn.execute("DELETE FROM last_fired WHERE phone = ?", (r["phone"],))
+            conn.execute(
+                "INSERT INTO last_fired (phone, content, due_at, fired_at) VALUES (?, ?, ?, ?)",
+                (r["phone"], r["content"], r["due_at"], now_iso),
+            )
+            conn.commit()
+        except Exception as e:
+            print(f"Error enviando recordatorio {r['id']}: {e}")
+
+    conn.close()
+
+
+WEATHER_CODE_DESCRIPTIONS = {
+    0: ("☀️", "despejado"), 1: ("🌤️", "mayormente despejado"), 2: ("⛅", "parcialmente nublado"),
+    3: ("☁️", "nublado"), 45: ("🌫️", "neblina"), 48: ("🌫️", "neblina con escarcha"),
+    51: ("🌦️", "llovizna ligera"), 53: ("🌦️", "llovizna"), 55: ("🌧️", "llovizna densa"),
+    61: ("🌧️", "lluvia ligera"), 63: ("🌧️", "lluvia"), 65: ("🌧️", "lluvia fuerte"),
+    71: ("🌨️", "nieve ligera"), 73: ("🌨️", "nieve"), 75: ("❄️", "nieve fuerte"),
+    80: ("🌦️", "chubascos ligeros"), 81: ("🌧️", "chubascos"), 82: ("⛈️", "chubascos fuertes"),
+    95: ("⛈️", "tormenta"), 96: ("⛈️", "tormenta con granizo"), 99: ("⛈️", "tormenta fuerte con granizo"),
+}
+
+
+def get_weather_summary() -> str | None:
+    """Consulta el clima actual con Open-Meteo (gratis, sin API key).
+    Reintenta una vez si la primera consulta falla (por ej. un 429 pasajero,
+    común en el plan gratuito de Render por IPs compartidas con otras apps)."""
+    for intento in range(2):
+        try:
+            resp = requests.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": WEATHER_LAT,
+                    "longitude": WEATHER_LON,
+                    "current": "temperature_2m,weather_code",
+                    "timezone": "auto",
+                },
+                headers={"User-Agent": "memorae-pro/1.0 (+https://memorae-pro.onrender.com)"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            current = resp.json()["current"]
+            temp = round(current["temperature_2m"])
+            emoji, desc = WEATHER_CODE_DESCRIPTIONS.get(current["weather_code"], ("🌡️", "condiciones variables"))
+            return f"{emoji} {temp}°C, {desc}"
+        except Exception as e:
+            print(f"Error consultando el clima (intento {intento + 1}/2): {e}")
+            if intento == 0:
+                time.sleep(2)
+    return None
+
+
+def send_daily_summaries():
+    """Cada mañana (a la hora configurada), le manda a cada usuario con
+    recordatorios pendientes para hoy un resumen único con todo lo que tiene."""
+    conn = get_db()
+    today_str = datetime.now(tz).strftime("%Y-%m-%d")
+    phones = conn.execute(
+        "SELECT DISTINCT phone FROM reminders WHERE sent = 0"
+    ).fetchall()
+
+    weather = get_weather_summary()
+
+    for row in phones:
+        phone = row["phone"]
+        todays = conn.execute(
+            "SELECT content, due_at FROM reminders WHERE phone = ? AND sent = 0 AND due_at LIKE ? ORDER BY due_at ASC",
+            (phone, f"{today_str}%"),
+        ).fetchall()
+        if not todays:
+            continue
+        lines = ["☀️ ¡Buenos días! Esto es lo que tenés para hoy:"]
+        if weather:
+            lines.append(f"Clima: {weather}")
+            lines.append("")
+        for r in todays:
+            d = datetime.fromisoformat(r["due_at"])
+            lines.append(f"• {r['content']} — {d.strftime('%H:%M')}")
+        send_whatsapp(phone, "\n".join(lines))
+
+    conn.close()
+
+
+scheduler = BackgroundScheduler(timezone=str(tz))
+scheduler.add_job(check_due_reminders, "interval", minutes=1)
+scheduler.add_job(send_daily_summaries, "cron", hour=DAILY_SUMMARY_HOUR, minute=DAILY_SUMMARY_MINUTE)
+scheduler.start()
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return {"status": "ok", "time": datetime.now(tz).isoformat()}
+
+
+@app.route("/trigger-daily-summary", methods=["GET"])
+def trigger_daily_summary():
+    """Ruta manual para probar el resumen diario sin esperar a la hora programada."""
+    if not DASHBOARD_TOKEN or request.args.get("token") != DASHBOARD_TOKEN:
+        return "No autorizado. Falta el token correcto en la URL (?token=...).", 401
+    send_daily_summaries()
+    return {"status": "ok", "message": "Resumen diario disparado manualmente"}
+
+
+DASHBOARD_TOKEN = os.environ.get("DASHBOARD_TOKEN", "")
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mis recordatorios y notas</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background: #f4f4f5; margin: 0; padding: 24px; color: #1a1a1a; }
+  h1 { font-size: 1.4rem; margin-bottom: 4px; }
+  .subtitle { color: #666; margin-bottom: 24px; font-size: 0.9rem; }
+  .card { background: white; border-radius: 12px; padding: 16px 20px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+  .card h2 { font-size: 1.05rem; margin: 0 0 12px 0; }
+  ul { list-style: none; padding: 0; margin: 0; }
+  li { padding: 10px 0; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; gap: 12px; }
+  li:last-child { border-bottom: none; }
+  .content { flex: 1; }
+  .meta { color: #888; font-size: 0.85rem; white-space: nowrap; }
+  .empty { color: #999; font-style: italic; padding: 8px 0; }
+  select { margin-bottom: 16px; padding: 6px 10px; border-radius: 8px; border: 1px solid #ddd; }
+</style>
+</head>
+<body>
+  <h1>📱 Memorae Pro</h1>
+  <div class="subtitle">Actualizado: {{ now }}</div>
+
+  <div class="card">
+    <h2>📌 Recordatorios pendientes ({{ reminders|length }})</h2>
+    {% if reminders %}
+    <ul>
+      {% for r in reminders %}
+      <li><span class="content">{{ r.content }}</span><span class="meta">{{ r.due_at }}</span></li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <div class="empty">No tenés recordatorios pendientes.</div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>🗒️ Notas guardadas ({{ notes|length }})</h2>
+    {% if notes %}
+    <ul>
+      {% for n in notes %}
+      <li><span class="content">{{ n.content }}</span><span class="meta">{{ n.created_at }}</span></li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <div class="empty">No tenés notas guardadas.</div>
+    {% endif %}
+  </div>
+</body>
+</html>"""
+
+
+@app.route("/dashboard", methods=["GET"])
+def dashboard():
+    if not DASHBOARD_TOKEN or request.args.get("token") != DASHBOARD_TOKEN:
+        return "No autorizado. Falta el token correcto en la URL (?token=...).", 401
+
+    phone = request.args.get("phone", "")
+    conn = get_db()
+
+    if phone:
+        reminders = conn.execute(
+            "SELECT content, due_at FROM reminders WHERE phone = ? AND sent = 0 ORDER BY due_at ASC",
+            (phone,),
+        ).fetchall()
+        notes = conn.execute(
+            "SELECT content, created_at FROM notes WHERE phone = ? ORDER BY id DESC",
+            (phone,),
+        ).fetchall()
+    else:
+        reminders = conn.execute(
+            "SELECT content, due_at FROM reminders WHERE sent = 0 ORDER BY due_at ASC"
+        ).fetchall()
+        notes = conn.execute(
+            "SELECT content, created_at FROM notes ORDER BY id DESC"
+        ).fetchall()
+    conn.close()
+
+    from flask import render_template_string
+    return render_template_string(
+        DASHBOARD_HTML,
+        reminders=reminders,
+        notes=notes,
+        now=datetime.now(tz).strftime("%d/%m/%Y %H:%M"),
+    )
+
+
+if __name__ == "__main__":
+    init_db()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
+else:
+    init_db()
