@@ -392,6 +392,7 @@ def process_and_reply(phone: str, incoming_msg: str, media_url: str = None, medi
 
     try:
         result = classify_message(incoming_msg, pending_reminders)
+        print(f"[process_and_reply] Clasificación de Gemini: {json.dumps(result, ensure_ascii=False)}")
     except Exception as e:
         print(f"Error clasificando mensaje: {e}")
         send_whatsapp(phone, "⚠️ Tuve un problema entendiendo tu mensaje (el servicio de IA no respondió). Intenta de nuevo en un momento.")
