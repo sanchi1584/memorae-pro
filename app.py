@@ -145,6 +145,10 @@ Dado un mensaje del usuario, responde SOLO con un JSON (sin texto adicional, sin
 
 Reglas:
 - "reminder": el usuario quiere que le avises algo en un momento futuro (ej. "recuérdame llamar al doctor mañana a las 5pm").
+  IMPORTANTE: si el mensaje empieza con un verbo imperativo tipo "recordame", "avisame", "acordate de avisarme"
+  seguido de una indicación de tiempo, SIEMPRE es "reminder" (nunca "question"), sin importar qué tan largo o
+  detallado sea el pedido (por ejemplo, "recordame cada 2 horas de 8am a 10pm que estudie, todos los días hasta
+  el viernes" es un "reminder" recurrente, no una pregunta ni un comentario).
 - "note": el usuario quiere guardar información sin fecha de aviso (ej. "anota que mi talla de zapato es 9").
 - "list_reminders": el usuario pide ver sus recordatorios pendientes.
 - "list_notes": el usuario pide ver sus notas guardadas.
@@ -210,7 +214,7 @@ def call_gemini(system_instruction: str, contents: list, max_retries: int = 3) -
         "system_instruction": {"parts": [{"text": system_instruction}]},
         "contents": contents,
         "generationConfig": {
-            "thinkingConfig": {"thinkingLevel": "minimal"},
+            "thinkingConfig": {"thinkingLevel": "low"},
             "maxOutputTokens": 500,
         },
     }
