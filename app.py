@@ -221,7 +221,7 @@ def call_gemini(system_instruction: str, contents: list, max_retries: int = 3) -
         "contents": contents,
         "generationConfig": {
             "thinkingConfig": {"thinkingLevel": "medium"},
-            "maxOutputTokens": 500,
+            "maxOutputTokens": 3000,
         },
     }
 
@@ -328,6 +328,7 @@ def classify_message(user_message: str, pending_reminders: list) -> dict:
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
+        print(f"[classify_message] JSON inválido/incompleto de Gemini (largo={len(raw)}): {raw!r}")
         # Si el modelo no devuelve JSON válido, lo tratamos como pregunta general
         return {"type": "question", "content": user_message, "due_at": None}
 
