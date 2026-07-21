@@ -144,11 +144,17 @@ Dado un mensaje del usuario, responde SOLO con un JSON (sin texto adicional, sin
 }}}}
 
 Reglas:
+- REGLA DE MÁXIMA PRIORIDAD: si el mensaje del usuario empieza con un verbo imperativo como "recordame", "avisame",
+  "acordate de avisarme", "hazme acordar", seguido de CUALQUIER indicación de tiempo (una hora puntual, "cada X
+  horas", "todos los días", un rango horario, una fecha límite, etc.), el campo "type" debe ser EXACTAMENTE
+  "reminder". Esto es así sin excepción, sin importar qué tan largo, detallado o parecido a una descripción de
+  plan suene el mensaje. NUNCA clasifiques un mensaje así como "question", aunque el pedido incluya varias
+  condiciones (rango de horas, repetición diaria, fecha de fin, etc.) — todas esas condiciones son datos para
+  calcular "due_at" y "occurrences", no motivo para tratarlo como pregunta o comentario.
+  Ejemplo: el mensaje "recordame cada 2 horas de 8am a 10pm que estudie, todos los días hasta el viernes" DEBE
+  clasificarse con "type": "reminder", "content": "estudiar", y "due_at"/"occurrences" con TODAS las fechas/horas
+  futuras calculadas (nunca "type": "question", aunque el mensaje describa varias condiciones a la vez).
 - "reminder": el usuario quiere que le avises algo en un momento futuro (ej. "recuérdame llamar al doctor mañana a las 5pm").
-  IMPORTANTE: si el mensaje empieza con un verbo imperativo tipo "recordame", "avisame", "acordate de avisarme"
-  seguido de una indicación de tiempo, SIEMPRE es "reminder" (nunca "question"), sin importar qué tan largo o
-  detallado sea el pedido (por ejemplo, "recordame cada 2 horas de 8am a 10pm que estudie, todos los días hasta
-  el viernes" es un "reminder" recurrente, no una pregunta ni un comentario).
 - "note": el usuario quiere guardar información sin fecha de aviso (ej. "anota que mi talla de zapato es 9").
 - "list_reminders": el usuario pide ver sus recordatorios pendientes.
 - "list_notes": el usuario pide ver sus notas guardadas.
@@ -214,7 +220,7 @@ def call_gemini(system_instruction: str, contents: list, max_retries: int = 3) -
         "system_instruction": {"parts": [{"text": system_instruction}]},
         "contents": contents,
         "generationConfig": {
-            "thinkingConfig": {"thinkingLevel": "low"},
+            "thinkingConfig": {"thinkingLevel": "medium"},
             "maxOutputTokens": 500,
         },
     }
